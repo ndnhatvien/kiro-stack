@@ -19,7 +19,6 @@ import (
 	"kiro-api-proxy/pool"
 	"kiro-api-proxy/proxy"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,8 +26,6 @@ import (
 )
 
 func main() {
-	// 初始化随机种子（用于账号随机选择）
-	rand.Seed(time.Now().UnixNano())
 	// 配置文件路径，支持环境变量覆盖
 	configPath := "data/config.json"
 	if envPath := os.Getenv("CONFIG_PATH"); envPath != "" {
@@ -63,7 +60,16 @@ func main() {
 	log.Printf("Claude API: http://%s/v1/messages", addr)
 	log.Printf("OpenAI API: http://%s/v1/chat/completions", addr)
 
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	// 创建自定义 HTTP 服务器，增加请求大小限制
+	server := &http.Server{
+		Addr:           addr,
+		Handler:        handler,
+		MaxHeaderBytes: 10 << 20, // 10MB header limit
+		ReadTimeout:    300 * time.Second,
+		WriteTimeout:   300 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }

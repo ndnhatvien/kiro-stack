@@ -1,20 +1,13 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-api-proxy/auth"
 	"kiro-api-proxy/config"
 	"kiro-api-proxy/pool"
-	"math/rand"
 	"net/http"
-	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,156 +16,63 @@ import (
 	"github.com/google/uuid"
 )
 
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (sr *statusRecorder) WriteHeader(code int) {
-	sr.status = code
-	sr.ResponseWriter.WriteHeader(code)
-}
-
-func (sr *statusRecorder) Write(b []byte) (int, error) {
-	if sr.status == 0 {
-		sr.status = http.StatusOK
-	}
-	return sr.ResponseWriter.Write(b)
-}
-
-type RequestLogAttempt struct {
-	Try        int   `json:"try"`
-	AccountID  string `json:"accountId,omitempty"`
-	Email      string `json:"email,omitempty"`
-	StatusCode int   `json:"statusCode"`
-	Error      string `json:"error,omitempty"`
-	DurationMs int64 `json:"durationMs"`
-}
-
-type RequestLogEntry struct {
-	Time         int64               `json:"time"`
-	Path         string              `json:"path"`
-	Model        string              `json:"model,omitempty"`
-	AccountID    string              `json:"accountId,omitempty"`
-	Email        string              `json:"email,omitempty"`
-	Attempts     int                 `json:"attempts"`
-	FinalStatus  int                 `json:"finalStatus"`
-	DurationMs   int64               `json:"durationMs"`
-	Error        string              `json:"error,omitempty"`
-	AttemptItems []RequestLogAttempt `json:"attemptItems,omitempty"`
-}
-
-type requestLogRing struct {
-	mu    sync.RWMutex
-	buf   []RequestLogEntry
-	next  int
-	count int
-}
-
-func newRequestLogRing(size int) *requestLogRing {
-	if size <= 0 {
-		size = 500
-	}
-	return &requestLogRing{buf: make([]RequestLogEntry, size)}
-}
-
-func (r *requestLogRing) Add(entry RequestLogEntry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf[r.next] = entry
-	r.next = (r.next + 1) % len(r.buf)
-	if r.count < len(r.buf) {
-		r.count++
-	}
-}
-
-func (r *requestLogRing) List(limit int) []RequestLogEntry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.count == 0 {
-		return []RequestLogEntry{}
-	}
-	if limit <= 0 || limit > r.count {
-		limit = r.count
-	}
-	result := make([]RequestLogEntry, 0, limit)
-	for i := 0; i < limit; i++ {
-		idx := (r.next - 1 - i + len(r.buf)) % len(r.buf)
-		result = append(result, r.buf[idx])
-	}
-	return result
-}
-
-type RequestFinalMetrics struct {
-	Path         string
-	Model        string
-	AccountID    string
-	AccountEmail string
-	Attempts     int
-	FinalStatus  int
-	DurationMs   int64
-	Error        string
-	AttemptItems []RequestLogAttempt
-	TotalTokens  int
-	Credits      float64
-}
-
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
 	// 运行时统计 (使用原子操作)
-	totalRequests         int64
-	successRequests       int64
-	failedRequests        int64
-	attemptFailedRequests int64
-	totalRetries          int64
-	totalTokens           int64
-	totalCredits          float64 // float64 需要用锁保护
-	creditsMu             sync.RWMutex
-	startTime             int64
-	stopRefresh           chan struct{}
-	stopStatsSaver        chan struct{}
-	requestLogs           *requestLogRing
+	totalRequests   int64
+	successRequests int64
+	failedRequests  int64
+	totalTokens     int64
+	totalCredits    float64 // float64 需要用锁保护
+	creditsMu       sync.RWMutex
+	startTime       int64
+	stopRefresh     chan struct{}
+	stopStatsSaver  chan struct{}
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
-	gatewayBase     string
-	gatewayAPIKey   string
-	gatewayProxy    *httputil.ReverseProxy
+}
+
+type thinkingStreamSource int
+
+const (
+	thinkingSourceUnknown thinkingStreamSource = iota
+	thinkingSourceReasoningEvent
+	thinkingSourceTagBlock
+)
+
+func allowReasoningSource(source *thinkingStreamSource) bool {
+	if *source == thinkingSourceTagBlock {
+		return false
+	}
+	*source = thinkingSourceReasoningEvent
+	return true
+}
+
+func allowTagSource(source *thinkingStreamSource) bool {
+	if *source == thinkingSourceReasoningEvent {
+		return false
+	}
+	if *source == thinkingSourceUnknown {
+		*source = thinkingSourceTagBlock
+	}
+	return *source == thinkingSourceTagBlock
 }
 
 func NewHandler() *Handler {
-	totalReq, successReq, failedReq, attemptFailedReq, totalRetries, totalTokens, totalCredits := config.GetStats()
+	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
-		pool:                  pool.GetPool(),
-		totalRequests:         int64(totalReq),
-		successRequests:       int64(successReq),
-		failedRequests:        int64(failedReq),
-		attemptFailedRequests: int64(attemptFailedReq),
-		totalRetries:          int64(totalRetries),
-		totalTokens:           int64(totalTokens),
-		totalCredits:          totalCredits,
-		startTime:             time.Now().Unix(),
-		stopRefresh:           make(chan struct{}),
-		stopStatsSaver:        make(chan struct{}),
-		requestLogs:           newRequestLogRing(500),
-		gatewayBase:           strings.TrimRight(os.Getenv("KIRO_GATEWAY_BASE"), "/"),
-		gatewayAPIKey:         os.Getenv("KIRO_GATEWAY_API_KEY"),
-	}
-	if h.gatewayBase != "" {
-		if u, err := url.Parse(h.gatewayBase); err == nil {
-			h.gatewayProxy = httputil.NewSingleHostReverseProxy(u)
-			origDirector := h.gatewayProxy.Director
-			h.gatewayProxy.Director = func(req *http.Request) {
-				origDirector(req)
-				if h.gatewayAPIKey != "" {
-					req.Header.Set("Authorization", "Bearer "+h.gatewayAPIKey)
-				}
-			}
-			logger := fmt.Sprintf("[GatewayProxy] enabled -> %s", h.gatewayBase)
-			_ = logger
-		}
+		pool:            pool.GetPool(),
+		totalRequests:   int64(totalReq),
+		successRequests: int64(successReq),
+		failedRequests:  int64(failedReq),
+		totalTokens:     int64(totalTokens),
+		totalCredits:    totalCredits,
+		startTime:       time.Now().Unix(),
+		stopRefresh:     make(chan struct{}),
+		stopStatsSaver:  make(chan struct{}),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -265,300 +165,8 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 	return providedKey == expectedKey
 }
 
-func (h *Handler) useGatewayProxy() bool {
-	return h.gatewayProxy != nil
-}
-
-func (h *Handler) selectGatewayAccountWithTried(tried map[string]bool) *config.Account {
-	accounts := h.pool.GetAllAccounts()
-	if len(accounts) == 0 {
-		return nil
-	}
-
-	candidates := make([]config.Account, 0, len(accounts))
-	for _, a := range accounts {
-		if !a.Enabled || a.RefreshToken == "" {
-			continue
-		}
-		if tried != nil && tried[a.ID] {
-			continue
-		}
-		candidates = append(candidates, a)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// 优先 + 可降级：永远先试最高权重组，失败后在下一轮降级到次高权重组
-	maxWeight := 0
-	for i := range candidates {
-		w := candidates[i].Weight
-		if w <= 0 {
-			w = 100
-		}
-		if w > maxWeight {
-			maxWeight = w
-		}
-	}
-	if maxWeight <= 0 {
-		maxWeight = 100
-	}
-
-	top := make([]config.Account, 0, len(candidates))
-	for i := range candidates {
-		w := candidates[i].Weight
-		if w <= 0 {
-			w = 100
-		}
-		if w == maxWeight {
-			top = append(top, candidates[i])
-		}
-	}
-	if len(top) == 0 {
-		chosen := candidates[rand.Intn(len(candidates))]
-		return &chosen
-	}
-	chosen := top[rand.Intn(len(top))]
-	return &chosen
-}
-
-func (h *Handler) buildGatewayPools(accounts []config.Account) ([]config.Account, []config.Account) {
-	primary := make([]config.Account, 0)
-	fallback := make([]config.Account, 0)
-	for _, a := range accounts {
-		if !a.Enabled || a.RefreshToken == "" {
-			continue
-		}
-		if a.UsageCurrent >= 10 {
-			primary = append(primary, a)
-		} else {
-			fallback = append(fallback, a)
-		}
-	}
-	return primary, fallback
-}
-
-func (h *Handler) pickWeightedGateway(candidates []config.Account) *config.Account {
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// 严格优先：仅从最高权重组里选择（同权重再随机）
-	maxWeight := 0
-	for i := range candidates {
-		w := candidates[i].Weight
-		if w <= 0 {
-			w = 100
-		}
-		if w > maxWeight {
-			maxWeight = w
-		}
-	}
-	if maxWeight <= 0 {
-		maxWeight = 100
-	}
-
-	top := make([]config.Account, 0, len(candidates))
-	for i := range candidates {
-		w := candidates[i].Weight
-		if w <= 0 {
-			w = 100
-		}
-		if w == maxWeight {
-			top = append(top, candidates[i])
-		}
-	}
-	if len(top) == 0 {
-		chosen := candidates[rand.Intn(len(candidates))]
-		return &chosen
-	}
-
-	chosen := top[rand.Intn(len(top))]
-	return &chosen
-}
-
-func (h *Handler) proxyToGatewayWithAccount(w http.ResponseWriter, r *http.Request, account *config.Account) {
-	if h.gatewayProxy == nil {
-		http.Error(w, "gateway proxy not configured", 500)
-		return
-	}
-
-	if account != nil {
-		r.Header.Set("X-Kiro-Refresh-Token", account.RefreshToken)
-		r.Header.Set("X-Kiro-Region", account.Region)
-		r.Header.Set("X-Kiro-Auth-Method", account.AuthMethod)
-		r.Header.Set("X-Kiro-Client-Id", account.ClientID)
-		r.Header.Set("X-Kiro-Client-Secret", account.ClientSecret)
-	}
-
-	h.gatewayProxy.ServeHTTP(w, r)
-}
-
-func (h *Handler) proxyWithFailover(w http.ResponseWriter, r *http.Request) {
-	if h.gatewayProxy == nil {
-		http.Error(w, "gateway proxy not configured", 500)
-		return
-	}
-
-	reqStart := time.Now()
-	bodyBytes, _ := io.ReadAll(r.Body)
-	r.Body.Close()
-	model := extractModelFromRequestBody(bodyBytes)
-
-	maxAttempts := 4
-	if r.URL.Path == "/v1/models" || r.Method == http.MethodGet {
-		maxAttempts = 2
-	}
-
-	var (
-		lastStatus int
-		lastBody   []byte
-		lastHeader http.Header
-		lastError  string
-		lastAccID  string
-		lastEmail  string
-	)
-
-	attemptItems := make([]RequestLogAttempt, 0, maxAttempts)
-	tried := map[string]bool{}
-
-	for i := 0; i < maxAttempts; i++ {
-		acc := h.selectGatewayAccountWithTried(tried)
-		if acc == nil {
-			break
-		}
-		tried[acc.ID] = true
-
-		lastAccID = acc.ID
-		lastEmail = acc.Email
-
-		cloneReq := r.Clone(r.Context())
-		cloneReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		cloneReq.ContentLength = int64(len(bodyBytes))
-		if len(bodyBytes) > 0 {
-			cloneReq.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-			}
-		}
-
-		tryStart := time.Now()
-		rec := httptest.NewRecorder()
-		h.proxyToGatewayWithAccount(rec, cloneReq, acc)
-		resp := rec.Result()
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		lastStatus = resp.StatusCode
-		lastBody = respBody
-		lastHeader = resp.Header.Clone()
-		if resp.StatusCode >= 400 {
-			lastError = string(respBody)
-		} else {
-			lastError = ""
-		}
-
-		attemptItems = append(attemptItems, RequestLogAttempt{
-			Try:        len(attemptItems) + 1,
-			AccountID:  acc.ID,
-			Email:      acc.Email,
-			StatusCode: resp.StatusCode,
-			DurationMs: time.Since(tryStart).Milliseconds(),
-			Error:      truncateError(lastError),
-		})
-
-		// success
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			for k, vals := range resp.Header {
-				for _, v := range vals {
-					w.Header().Add(k, v)
-				}
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(respBody)
-
-			totalTokens, credits := extractUsageMetrics(respBody)
-			h.finalizeRequest(RequestFinalMetrics{
-				Path:         r.URL.Path,
-				Model:        model,
-				AccountID:    acc.ID,
-				AccountEmail: acc.Email,
-				Attempts:     len(attemptItems),
-				FinalStatus:  resp.StatusCode,
-				DurationMs:   time.Since(reqStart).Milliseconds(),
-				AttemptItems: attemptItems,
-				TotalTokens:  totalTokens,
-				Credits:      credits,
-			})
-			return
-		}
-
-		// classify failover conditions
-		if resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			// mark cooldown in pool
-			h.pool.RecordError(acc.ID, resp.StatusCode == 402 || resp.StatusCode == 429)
-			continue
-		}
-
-		// non-retryable, return immediately
-		for k, vals := range resp.Header {
-			for _, v := range vals {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBody)
-
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         r.URL.Path,
-			Model:        model,
-			AccountID:    acc.ID,
-			AccountEmail: acc.Email,
-			Attempts:     len(attemptItems),
-			FinalStatus:  resp.StatusCode,
-			DurationMs:   time.Since(reqStart).Milliseconds(),
-			Error:        truncateError(lastError),
-			AttemptItems: attemptItems,
-		})
-		return
-	}
-
-	if lastStatus == 0 {
-		lastStatus = http.StatusServiceUnavailable
-		lastError = "no available account"
-		http.Error(w, "no available account", http.StatusServiceUnavailable)
-	} else {
-		if lastHeader != nil {
-			for k, vals := range lastHeader {
-				for _, v := range vals {
-					w.Header().Add(k, v)
-				}
-			}
-		}
-		w.WriteHeader(lastStatus)
-		_, _ = w.Write(lastBody)
-	}
-
-	h.finalizeRequest(RequestFinalMetrics{
-		Path:         r.URL.Path,
-		Model:        model,
-		AccountID:    lastAccID,
-		AccountEmail: lastEmail,
-		Attempts:     max(1, len(attemptItems)),
-		FinalStatus:  lastStatus,
-		DurationMs:   time.Since(reqStart).Milliseconds(),
-		Error:        truncateError(lastError),
-		AttemptItems: attemptItems,
-	})
-}
-
-func (h *Handler) proxyToGateway(w http.ResponseWriter, r *http.Request) {
-	// fallback legacy behavior
-	h.proxyToGatewayWithAccount(w, r, nil)
-}
-
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
 	path := r.URL.Path
 
 	// CORS - 完整的头部支持
@@ -580,18 +188,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
 			return
 		}
-		if h.useGatewayProxy() {
-			h.proxyWithFailover(w, r)
-			return
-		}
 		h.handleClaudeMessages(w, r)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		if !h.validateApiKey(r) {
 			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
-			return
-		}
-		if h.useGatewayProxy() {
-			h.proxyWithFailover(w, r)
 			return
 		}
 		h.handleCountTokens(w, r)
@@ -600,16 +200,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
 			return
 		}
-		if h.useGatewayProxy() {
-			h.proxyWithFailover(w, r)
-			return
-		}
 		h.handleOpenAIChat(w, r)
 	case path == "/v1/models" || path == "/models":
-		if h.useGatewayProxy() {
-			h.proxyWithFailover(w, r)
-			return
-		}
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
@@ -682,34 +274,33 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	var models []map[string]interface{}
 	if len(cached) > 0 {
 		for _, m := range cached {
-			models = append(models, map[string]interface{}{
-				"id": m.ModelId, "object": "model", "owned_by": "anthropic",
-			})
+			supportsImage := modelSupportsImage(m.InputTypes)
+			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
 			// 自动生成 thinking 变体
-			models = append(models, map[string]interface{}{
-				"id": m.ModelId + thinkingSuffix, "object": "model", "owned_by": "anthropic",
-			})
+			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
 		}
 	} else {
 		// fallback 静态列表
 		models = []map[string]interface{}{
-			{"id": "claude-sonnet-4.6", "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-sonnet-4.6" + thinkingSuffix, "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-sonnet-4.5", "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-sonnet-4.5" + thinkingSuffix, "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-sonnet-4", "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-sonnet-4" + thinkingSuffix, "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-haiku-4.5", "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-haiku-4.5" + thinkingSuffix, "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-opus-4.5", "object": "model", "owned_by": "anthropic"},
-			{"id": "claude-opus-4.5" + thinkingSuffix, "object": "model", "owned_by": "anthropic"},
+			buildModelInfo("claude-sonnet-4.6", "anthropic", true),
+			buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-opus-4.6", "anthropic", true),
+			buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-sonnet-4.5", "anthropic", true),
+			buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-sonnet-4", "anthropic", true),
+			buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-haiku-4.5", "anthropic", true),
+			buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
+			buildModelInfo("claude-opus-4.5", "anthropic", true),
+			buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
 		}
 	}
 	// 添加别名模型
 	models = append(models,
-		map[string]interface{}{"id": "auto", "object": "model", "owned_by": "kiro-proxy"},
-		map[string]interface{}{"id": "gpt-4o", "object": "model", "owned_by": "kiro-proxy"},
-		map[string]interface{}{"id": "gpt-4", "object": "model", "owned_by": "kiro-proxy"},
+		buildModelInfo("auto", "kiro-proxy", true),
+		buildModelInfo("gpt-4o", "kiro-proxy", true),
+		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -717,6 +308,49 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   models,
 	})
+}
+
+func modelSupportsImage(inputTypes []string) bool {
+	for _, t := range inputTypes {
+		lt := strings.ToLower(t)
+		if strings.Contains(lt, "image") || strings.Contains(lt, "vision") {
+			return true
+		}
+	}
+	return false
+}
+
+func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
+	modalities := []string{"text"}
+	if supportsImage {
+		modalities = append(modalities, "image")
+	}
+	modalitiesMap := map[string][]string{
+		"input":  modalities,
+		"output": []string{"text"},
+	}
+
+	return map[string]interface{}{
+		"id":               id,
+		"object":           "model",
+		"owned_by":         ownedBy,
+		"supports_image":   supportsImage,
+		"input_modalities": modalities,
+		"modalities":       modalitiesMap,
+		"capabilities": map[string]bool{
+			"vision":       supportsImage,
+			"image":        supportsImage,
+			"image_vision": supportsImage,
+		},
+		"info": map[string]interface{}{
+			"meta": map[string]interface{}{
+				"capabilities": map[string]bool{
+					"vision":       supportsImage,
+					"image_vision": supportsImage,
+				},
+			},
+		},
+	}
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
@@ -759,50 +393,13 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Messages []struct {
-			Role    string      `json:"role"`
-			Content interface{} `json:"content"`
-		} `json:"messages"`
-		System interface{} `json:"system"`
-	}
+	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
 
-	// 简单估算 token 数量（每 4 个字符约 1 个 token）
-	var totalChars int
-	for _, msg := range req.Messages {
-		switch content := msg.Content.(type) {
-		case string:
-			totalChars += len(content)
-		case []interface{}:
-			for _, part := range content {
-				if p, ok := part.(map[string]interface{}); ok {
-					if text, ok := p["text"].(string); ok {
-						totalChars += len(text)
-					}
-				}
-			}
-		}
-	}
-
-	// 系统提示
-	switch system := req.System.(type) {
-	case string:
-		totalChars += len(system)
-	case []interface{}:
-		for _, part := range system {
-			if p, ok := part.(map[string]interface{}); ok {
-				if text, ok := p["text"].(string); ok {
-					totalChars += len(text)
-				}
-			}
-		}
-	}
-
-	estimatedTokens := (totalChars + 3) / 4 // 向上取整
+	estimatedTokens := estimateClaudeRequestInputTokens(&req)
 	if estimatedTokens < 1 {
 		estimatedTokens = 1
 	}
@@ -813,12 +410,17 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 // handleClaudeMessages Claude API 处理
 func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
+	h.handleClaudeMessagesInternal(w, r)
+}
+
+func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
 	}
 
-	requestStart := time.Now()
+	// 限制请求体大小为 100MB
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
 
 	// 读取请求
 	body, err := io.ReadAll(r.Body)
@@ -837,44 +439,12 @@ func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:        r.URL.Path,
-			Model:       req.Model,
-			Attempts:    1,
-			FinalStatus: 503,
-			DurationMs:  time.Since(requestStart).Milliseconds(),
-			Error:       "No available accounts",
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				StatusCode: 503,
-				Error:      "No available accounts",
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
 	// 检查并刷新 token
 	if err := h.ensureValidToken(account); err != nil {
 		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         r.URL.Path,
-			Model:        req.Model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  503,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 503,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
@@ -882,20 +452,21 @@ func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// 流式或非流式
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, requestStart)
+		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, requestStart)
+		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, requestStart time.Time) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -910,89 +481,167 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
 
 	msgID := "msg_" + uuid.New().String()
-	var contentStarted bool
-	var toolUseIndex int
 	var inputTokens, outputTokens int
 	var credits float64
 	var toolUses []KiroToolUse
+	var nextContentIndex int
+	var rawContentBuilder strings.Builder
+	var rawThinkingBuilder strings.Builder
+	activeBlockIndex := -1
+	activeBlockType := ""
+	startInputTokens := estimatedInputTokens
+
+	closeActiveBlock := func() {
+		if activeBlockIndex < 0 {
+			return
+		}
+		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": activeBlockIndex,
+		})
+		activeBlockIndex = -1
+		activeBlockType = ""
+	}
+
+	startContentBlock := func(blockType string) {
+		if activeBlockType == blockType {
+			return
+		}
+		closeActiveBlock()
+
+		idx := nextContentIndex
+		nextContentIndex++
+
+		if blockType == "thinking" {
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]string{
+					"type":     "thinking",
+					"thinking": "",
+				},
+			})
+		} else {
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]string{
+					"type": "text",
+					"text": "",
+				},
+			})
+		}
+
+		activeBlockIndex = idx
+		activeBlockType = blockType
+	}
 
 	// Thinking 标签解析状态
 	var textBuffer string
 	var inThinkingBlock bool
+	var dropTagThinking bool
+	var thinkingSource thinkingStreamSource
 
 	// 发送文本的辅助函数
 	// thinkingState: 0=普通内容, 1=thinking开始, 2=thinking中间, 3=thinking结束
 	sendText := func(text string, thinkingState int) {
-		// 确保 content_block 已开始
-		if !contentStarted {
-			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-				"type":          "content_block_start",
-				"index":         0,
-				"content_block": map[string]string{"type": "text", "text": ""},
-			})
-			contentStarted = true
-		}
-
 		if thinkingState == 0 {
 			// 普通内容
 			if text == "" {
 				return
 			}
+			startContentBlock("text")
 			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": activeBlockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": text},
 			})
-		} else {
-			// thinking 内容
+			return
+		}
+
+		if !thinking {
+			return
+		}
+
+		switch thinkingFormat {
+		case "think":
 			var outputText string
-			switch thinkingFormat {
-			case "think":
-				switch thinkingState {
-				case 1:
-					outputText = "<think>" + text
-				case 2:
-					outputText = text
-				case 3:
-					outputText = text + "</think>"
-				}
-			case "reasoning_content":
-				// Claude 格式不支持 reasoning_content，直接输出内容
+			switch thinkingState {
+			case 1:
+				outputText = "<think>" + text
+			case 2:
 				outputText = text
-			default: // "thinking"
-				switch thinkingState {
-				case 1:
-					outputText = "<thinking>" + text
-				case 2:
-					outputText = text
-				case 3:
-					outputText = text + "</thinking>"
-				}
+			case 3:
+				outputText = text + "</think>"
 			}
 			if outputText == "" {
 				return
 			}
+			startContentBlock("text")
 			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": activeBlockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": outputText},
 			})
+		case "reasoning_content":
+			if text == "" {
+				return
+			}
+			startContentBlock("text")
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": activeBlockIndex,
+				"delta": map[string]string{"type": "text_delta", "text": text},
+			})
+		default:
+			if thinkingState == 3 && text == "" {
+				if activeBlockType == "thinking" {
+					closeActiveBlock()
+				}
+				return
+			}
+			if text != "" {
+				startContentBlock("thinking")
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": text},
+				})
+			}
+			if thinkingState == 3 && activeBlockType == "thinking" {
+				closeActiveBlock()
+			}
 		}
 	}
 
 	// 处理文本，解析 <thinking> 标签
 	var thinkingStarted bool
+	var eventThinkingOpen bool
 
 	processClaudeText := func(text string, isThinking bool, forceFlush bool) {
+		if isThinking && !thinking {
+			return
+		}
+
 		// 如果是 reasoningContentEvent，直接输出
 		if isThinking {
+			if !allowReasoningSource(&thinkingSource) {
+				return
+			}
 			if !thinkingStarted {
 				sendText(text, 1)
 				thinkingStarted = true
+				eventThinkingOpen = true
 			} else {
 				sendText(text, 2)
 			}
 			return
+		}
+
+		if eventThinkingOpen {
+			sendText("", 3)
+			eventThinkingOpen = false
+			thinkingStarted = false
 		}
 
 		textBuffer += text
@@ -1006,6 +655,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 					}
 					textBuffer = textBuffer[thinkingStart+10:]
 					inThinkingBlock = true
+					dropTagThinking = !allowTagSource(&thinkingSource)
 					thinkingStarted = false
 				} else if forceFlush || len([]rune(textBuffer)) > 50 {
 					// 使用 rune 切片来正确处理 Unicode 字符
@@ -1026,25 +676,33 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				thinkingEnd := strings.Index(textBuffer, "</thinking>")
 				if thinkingEnd != -1 {
 					content := textBuffer[:thinkingEnd]
-					if !thinkingStarted {
-						sendText(content, 1)
-						sendText("", 3)
-					} else {
-						sendText(content, 3)
+					if !dropTagThinking {
+						if !thinkingStarted {
+							sendText(content, 1)
+							sendText("", 3)
+						} else {
+							sendText(content, 3)
+						}
 					}
 					textBuffer = textBuffer[thinkingEnd+11:]
 					inThinkingBlock = false
+					dropTagThinking = false
 					thinkingStarted = false
 				} else if forceFlush {
 					if textBuffer != "" {
-						if !thinkingStarted {
-							sendText(textBuffer, 1)
-							sendText("", 3)
-						} else {
-							sendText(textBuffer, 3)
+						if !dropTagThinking {
+							if !thinkingStarted {
+								sendText(textBuffer, 1)
+								sendText("", 3)
+							} else {
+								sendText(textBuffer, 3)
+							}
 						}
 						textBuffer = ""
 					}
+					inThinkingBlock = false
+					dropTagThinking = false
+					thinkingStarted = false
 					break
 				} else {
 					// 流式输出 thinking 块内的内容
@@ -1052,11 +710,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 					if len(runes) > 20 {
 						safeLen := len(runes) - 15
 						if safeLen > 0 {
-							if !thinkingStarted {
-								sendText(string(runes[:safeLen]), 1)
-								thinkingStarted = true
-							} else {
-								sendText(string(runes[:safeLen]), 2)
+							if !dropTagThinking {
+								if !thinkingStarted {
+									sendText(string(runes[:safeLen]), 1)
+									thinkingStarted = true
+								} else {
+									sendText(string(runes[:safeLen]), 2)
+								}
 							}
 							textBuffer = string(runes[safeLen:])
 						}
@@ -1071,11 +731,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
-			"id":      msgID,
-			"type":    "message",
-			"role":    "assistant",
-			"content": []interface{}{},
-			"model":   model,
+			"id":            msgID,
+			"type":          "message",
+			"role":          "assistant",
+			"content":       []interface{}{},
+			"model":         model,
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]int{
+				"input_tokens":  startInputTokens,
+				"output_tokens": 0,
+			},
 		},
 	})
 
@@ -1084,27 +750,26 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			if text == "" {
 				return
 			}
+			if isThinking {
+				rawThinkingBuilder.WriteString(text)
+			} else {
+				rawContentBuilder.WriteString(text)
+			}
 			processClaudeText(text, isThinking, false)
 		},
 		OnToolUse: func(tu KiroToolUse) {
 			// 先刷新缓冲区
 			processClaudeText("", false, true)
+			rawContentBuilder.WriteString(tu.Name)
+			if b, err := json.Marshal(tu.Input); err == nil {
+				rawContentBuilder.Write(b)
+			}
 
 			toolUses = append(toolUses, tu)
+			closeActiveBlock()
 
-			// 关闭文本块
-			if contentStarted && toolUseIndex == 0 {
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": 0,
-				})
-			}
-
-			idx := toolUseIndex
-			if contentStarted {
-				idx = toolUseIndex + 1
-			}
-			toolUseIndex++
+			idx := nextContentIndex
+			nextContentIndex++
 
 			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 				"type":  "content_block_start",
@@ -1146,46 +811,37 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
-		})
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         "/v1/messages",
-			Model:        model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  500,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 500,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
 		})
 		return
 	}
 
 	// 刷新剩余缓冲区
 	processClaudeText("", false, true)
+	if eventThinkingOpen {
+		sendText("", 3)
+		eventThinkingOpen = false
+	}
+	closeActiveBlock()
 
-	h.recordSuccess(inputTokens, outputTokens, credits, 1)
+	inputTokens = estimatedInputTokens
+	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+	thinkingOutput := rawThinkingBuilder.String()
+	if thinking && thinkingOutput == "" && extractedReasoning != "" {
+		thinkingOutput = extractedReasoning
+	}
+	if !thinking {
+		thinkingOutput = ""
+	}
+	outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+
+	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-
-	// 关闭最后的内容块
-	if contentStarted && toolUseIndex == 0 {
-		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		})
-	}
 
 	// 发送 message_delta
 	stopReason := "end_turn"
@@ -1206,23 +862,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 		"type": "message_stop",
-	})
-
-	h.appendRequestLog(RequestFinalMetrics{
-		Path:         "/v1/messages",
-		Model:        model,
-		AccountID:    account.ID,
-		AccountEmail: account.Email,
-		Attempts:     1,
-		FinalStatus:  200,
-		DurationMs:   time.Since(requestStart).Milliseconds(),
-		AttemptItems: []RequestLogAttempt{{
-			Try:        1,
-			AccountID:  account.ID,
-			Email:      account.Email,
-			StatusCode: 200,
-			DurationMs: time.Since(requestStart).Milliseconds(),
-		}},
 	})
 }
 
@@ -1254,8 +893,6 @@ func (h *Handler) saveStats() {
 		int(atomic.LoadInt64(&h.totalRequests)),
 		int(atomic.LoadInt64(&h.successRequests)),
 		int(atomic.LoadInt64(&h.failedRequests)),
-		int(atomic.LoadInt64(&h.attemptFailedRequests)),
-		int(atomic.LoadInt64(&h.totalRetries)),
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
 	)
@@ -1276,134 +913,20 @@ func (h *Handler) addCredits(credits float64) {
 }
 
 // 统计记录 (使用原子操作)
-func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64, attempts int) {
+func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
-	if attempts > 1 {
-		atomic.AddInt64(&h.totalRetries, int64(attempts-1))
-	}
 	h.addCredits(credits)
 }
 
-func (h *Handler) recordFailure(attempts int) {
+func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
-	if attempts > 0 {
-		atomic.AddInt64(&h.attemptFailedRequests, int64(attempts))
-	}
-	if attempts > 1 {
-		atomic.AddInt64(&h.totalRetries, int64(attempts-1))
-	}
-}
-
-func (h *Handler) recordAttemptFailure(count int) {
-	if count > 0 {
-		atomic.AddInt64(&h.attemptFailedRequests, int64(count))
-	}
-}
-
-func (h *Handler) appendRequestLog(m RequestFinalMetrics) {
-	if h.requestLogs == nil {
-		return
-	}
-	entry := RequestLogEntry{
-		Time:         time.Now().Unix(),
-		Path:         m.Path,
-		Model:        m.Model,
-		AccountID:    m.AccountID,
-		Email:        m.AccountEmail,
-		Attempts:     max(1, m.Attempts),
-		FinalStatus:  m.FinalStatus,
-		DurationMs:   m.DurationMs,
-		Error:        m.Error,
-		AttemptItems: m.AttemptItems,
-	}
-	h.requestLogs.Add(entry)
-}
-
-func (h *Handler) finalizeRequest(m RequestFinalMetrics) {
-	attempts := max(1, m.Attempts)
-	attemptFailures := 0
-	if len(m.AttemptItems) > 0 {
-		for _, a := range m.AttemptItems {
-			if a.StatusCode >= 400 || a.Error != "" {
-				attemptFailures++
-			}
-		}
-	} else if m.FinalStatus >= 400 {
-		attemptFailures = attempts
-	}
-
-	if m.FinalStatus >= 200 && m.FinalStatus < 400 {
-		h.recordSuccess(0, 0, 0, attempts)
-		h.recordAttemptFailure(max(0, attemptFailures))
-	} else {
-		h.recordFailure(max(attempts, attemptFailures))
-	}
-
-	// 累加真实 tokens/credits（优先使用回调提供值）
-	if m.TotalTokens > 0 {
-		atomic.AddInt64(&h.totalTokens, int64(m.TotalTokens))
-	}
-	if m.Credits > 0 {
-		h.addCredits(m.Credits)
-	}
-
-	h.appendRequestLog(m)
-}
-
-func extractUsageMetrics(body []byte) (int, float64) {
-	if len(body) == 0 {
-		return 0, 0
-	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return 0, 0
-	}
-
-	totalTokens := 0
-	if usage, ok := obj["usage"].(map[string]interface{}); ok {
-		if v, ok := usage["total_tokens"].(float64); ok {
-			totalTokens = int(v)
-		} else {
-			pt, _ := usage["prompt_tokens"].(float64)
-			ct, _ := usage["completion_tokens"].(float64)
-			totalTokens = int(pt + ct)
-		}
-	}
-
-	credits := 0.0
-	if v, ok := obj["credits"].(float64); ok {
-		credits = v
-	}
-	return totalTokens, credits
-}
-
-func extractModelFromRequestBody(body []byte) string {
-	if len(body) == 0 {
-		return ""
-	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return ""
-	}
-	if m, ok := obj["model"].(string); ok {
-		return m
-	}
-	return ""
-}
-
-func truncateError(err string) string {
-	err = strings.TrimSpace(err)
-	if len(err) > 300 {
-		return err[:300] + "..."
-	}
-	return err
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, requestStart time.Time) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -1435,67 +958,44 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.sendClaudeError(w, 500, "api_error", err.Error())
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         "/v1/messages",
-			Model:        model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  500,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 500,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
-	h.recordSuccess(inputTokens, outputTokens, credits, 1)
+	// 合并 thinking 内容（如果有 reasoningContentEvent 的内容）
+	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
+	finalContent, extractedReasoning := extractThinkingFromContent(content)
+	if thinking && thinkingContent == "" && extractedReasoning != "" {
+		thinkingContent = extractedReasoning
+	}
+	if !thinking {
+		thinkingContent = ""
+	}
+
+	inputTokens = estimatedInputTokens
+	outputTokens = estimateClaudeOutputTokens(finalContent, thinkingContent, toolUses)
+
+	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
-	// 合并 thinking 内容（如果有 reasoningContentEvent 的内容）
-	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
-	finalContent := content
-	if thinkingContent != "" {
+	if thinking && thinkingContent != "" {
 		switch thinkingFormat {
 		case "think":
-			finalContent = "<think>" + thinkingContent + "</think>" + content
+			finalContent = "<think>" + thinkingContent + "</think>" + finalContent
+			thinkingContent = ""
 		case "reasoning_content":
-			finalContent = thinkingContent + content // Claude 格式不支持 reasoning_content，直接拼接
-		default: // "thinking"
-			finalContent = "<thinking>" + thinkingContent + "</thinking>" + content
+			finalContent = thinkingContent + finalContent // Claude 格式不支持 reasoning_content，直接拼接
+			thinkingContent = ""
+		default:
 		}
 	}
 
-	resp := KiroToClaudeResponse(finalContent, toolUses, inputTokens, outputTokens, model)
+	resp := KiroToClaudeResponse(finalContent, thinkingContent, toolUses, inputTokens, outputTokens, model)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
-
-	h.appendRequestLog(RequestFinalMetrics{
-		Path:         "/v1/messages",
-		Model:        model,
-		AccountID:    account.ID,
-		AccountEmail: account.Email,
-		Attempts:     1,
-		FinalStatus:  200,
-		DurationMs:   time.Since(requestStart).Milliseconds(),
-		AttemptItems: []RequestLogAttempt{{
-			Try:        1,
-			AccountID:  account.ID,
-			Email:      account.Email,
-			StatusCode: 200,
-			DurationMs: time.Since(requestStart).Milliseconds(),
-		}},
-	})
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -1517,7 +1017,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestStart := time.Now()
+	// 限制请求体大小为 100MB
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1534,43 +1035,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	account := h.pool.GetNext()
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:        r.URL.Path,
-			Model:       req.Model,
-			Attempts:    1,
-			FinalStatus: 503,
-			DurationMs:  time.Since(requestStart).Milliseconds(),
-			Error:       "No available accounts",
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				StatusCode: 503,
-				Error:      "No available accounts",
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
 	if err := h.ensureValidToken(account); err != nil {
 		h.sendOpenAIError(w, 503, "server_error", "Token refresh failed")
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         r.URL.Path,
-			Model:        req.Model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  503,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 503,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
@@ -1578,18 +1047,19 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	if req.Stream {
-		h.handleOpenAIStream(w, account, kiroPayload, req.Model, requestStart)
+		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
-		h.handleOpenAINonStream(w, account, kiroPayload, req.Model, requestStart)
+		h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, requestStart time.Time) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1608,10 +1078,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	var toolCallIndex int
 	var inputTokens, outputTokens int
 	var credits float64
+	var rawContentBuilder strings.Builder
+	var rawReasoningBuilder strings.Builder
 
 	// Thinking 标签解析状态
 	var textBuffer string
 	var inThinkingBlock bool
+	var dropTagThinking bool
+	var thinkingSource thinkingStreamSource
 
 	// 发送 chunk 的辅助函数
 	// thinkingState: 0=普通内容, 1=thinking开始, 2=thinking中间, 3=thinking结束
@@ -1623,6 +1097,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		var chunk map[string]interface{}
 
 		if thinkingState > 0 {
+			if !thinking {
+				return
+			}
 			// thinking 内容
 			switch thinkingFormat {
 			case "thinking":
@@ -1715,17 +1192,32 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	// 处理文本，解析 <thinking> 标签
 	// thinkingStarted 用于跟踪是否已发送开始标签
 	var thinkingStarted bool
+	var eventThinkingOpen bool
 
 	processText := func(text string, isThinking bool, forceFlush bool) {
+		if isThinking && !thinking {
+			return
+		}
+
 		// 如果是 reasoningContentEvent，直接输出
 		if isThinking {
+			if !allowReasoningSource(&thinkingSource) {
+				return
+			}
 			if !thinkingStarted {
 				sendChunk(text, 1) // 开始
 				thinkingStarted = true
+				eventThinkingOpen = true
 			} else {
 				sendChunk(text, 2) // 中间
 			}
 			return
+		}
+
+		if eventThinkingOpen {
+			sendChunk("", 3)
+			eventThinkingOpen = false
+			thinkingStarted = false
 		}
 
 		textBuffer += text
@@ -1741,6 +1233,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 					}
 					textBuffer = textBuffer[thinkingStart+10:] // 移除 <thinking>
 					inThinkingBlock = true
+					dropTagThinking = !allowTagSource(&thinkingSource)
 					thinkingStarted = false // 重置，准备发送新的开始标签
 				} else if forceFlush || len([]rune(textBuffer)) > 50 {
 					// 没有找到标签，安全输出（保留可能的部分标签）
@@ -1763,28 +1256,36 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 				if thinkingEnd != -1 {
 					// 输出 thinking 内容
 					content := textBuffer[:thinkingEnd]
-					if !thinkingStarted {
-						// 一次性输出完整内容（开始+内容+结束）
-						sendChunk(content, 1) // 开始
-						sendChunk("", 3)      // 结束（空内容，只发结束标签）
-					} else {
-						// 已经开始了，发送剩余内容和结束
-						sendChunk(content, 3) // 结束
+					if !dropTagThinking {
+						if !thinkingStarted {
+							// 一次性输出完整内容（开始+内容+结束）
+							sendChunk(content, 1) // 开始
+							sendChunk("", 3)      // 结束（空内容，只发结束标签）
+						} else {
+							// 已经开始了，发送剩余内容和结束
+							sendChunk(content, 3) // 结束
+						}
 					}
 					textBuffer = textBuffer[thinkingEnd+11:] // 移除 </thinking>
 					inThinkingBlock = false
+					dropTagThinking = false
 					thinkingStarted = false
 				} else if forceFlush {
 					// 强制刷新：输出剩余内容
 					if textBuffer != "" {
-						if !thinkingStarted {
-							sendChunk(textBuffer, 1) // 开始
-							sendChunk("", 3)         // 结束
-						} else {
-							sendChunk(textBuffer, 3) // 结束
+						if !dropTagThinking {
+							if !thinkingStarted {
+								sendChunk(textBuffer, 1) // 开始
+								sendChunk("", 3)         // 结束
+							} else {
+								sendChunk(textBuffer, 3) // 结束
+							}
 						}
 						textBuffer = ""
 					}
+					inThinkingBlock = false
+					dropTagThinking = false
+					thinkingStarted = false
 					break
 				} else {
 					// 流式输出 thinking 块内的内容
@@ -1792,11 +1293,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 					if len(runes) > 20 {
 						safeLen := len(runes) - 15 // 保留可能的 </thinking> 部分
 						if safeLen > 0 {
-							if !thinkingStarted {
-								sendChunk(string(runes[:safeLen]), 1) // 开始
-								thinkingStarted = true
-							} else {
-								sendChunk(string(runes[:safeLen]), 2) // 中间
+							if !dropTagThinking {
+								if !thinkingStarted {
+									sendChunk(string(runes[:safeLen]), 1) // 开始
+									thinkingStarted = true
+								} else {
+									sendChunk(string(runes[:safeLen]), 2) // 中间
+								}
 							}
 							textBuffer = string(runes[safeLen:])
 						}
@@ -1812,6 +1315,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			if text == "" {
 				return
 			}
+			if isThinking {
+				rawReasoningBuilder.WriteString(text)
+			} else {
+				rawContentBuilder.WriteString(text)
+			}
 			processText(text, isThinking, false)
 		},
 		OnToolUse: func(tu KiroToolUse) {
@@ -1819,6 +1327,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			processText("", false, true)
 
 			args, _ := json.Marshal(tu.Input)
+			rawContentBuilder.WriteString(tu.Name)
+			rawContentBuilder.Write(args)
 			tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
 			tc.Function.Name = tu.Name
 			tc.Function.Arguments = string(args)
@@ -1864,32 +1374,34 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         "/v1/chat/completions",
-			Model:        model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  500,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 500,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
 	// 刷新剩余缓冲区
 	processText("", false, true)
+	if eventThinkingOpen {
+		sendChunk("", 3)
+		eventThinkingOpen = false
+	}
 
-	h.recordSuccess(inputTokens, outputTokens, credits, 1)
+	inputTokens = estimatedInputTokens
+	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+	reasoningOutput := rawReasoningBuilder.String()
+	if thinking && reasoningOutput == "" && extractedReasoning != "" {
+		reasoningOutput = extractedReasoning
+	}
+	if !thinking {
+		reasoningOutput = ""
+	}
+	outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+	for _, tc := range toolCalls {
+		outputTokens += estimateApproxTokens(tc.Function.Name)
+		outputTokens += estimateApproxTokens(tc.Function.Arguments)
+	}
+
+	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -1919,27 +1431,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	fmt.Fprintf(w, "data: %s\n\n", string(data))
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
-
-	h.appendRequestLog(RequestFinalMetrics{
-		Path:         "/v1/chat/completions",
-		Model:        model,
-		AccountID:    account.ID,
-		AccountEmail: account.Email,
-		Attempts:     1,
-		FinalStatus:  200,
-		DurationMs:   time.Since(requestStart).Milliseconds(),
-		AttemptItems: []RequestLogAttempt{{
-			Try:        1,
-			AccountID:  account.ID,
-			Email:      account.Email,
-			StatusCode: 200,
-			DurationMs: time.Since(requestStart).Milliseconds(),
-		}},
-	})
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, requestStart time.Time) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
@@ -1962,60 +1457,31 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.sendOpenAIError(w, 500, "server_error", err.Error())
-		h.finalizeRequest(RequestFinalMetrics{
-			Path:         "/v1/chat/completions",
-			Model:        model,
-			AccountID:    account.ID,
-			AccountEmail: account.Email,
-			Attempts:     1,
-			FinalStatus:  500,
-			DurationMs:   time.Since(requestStart).Milliseconds(),
-			Error:        truncateError(err.Error()),
-			AttemptItems: []RequestLogAttempt{{
-				Try:        1,
-				AccountID:  account.ID,
-				Email:      account.Email,
-				StatusCode: 500,
-				Error:      truncateError(err.Error()),
-				DurationMs: time.Since(requestStart).Milliseconds(),
-			}},
-		})
 		return
 	}
 
-	h.recordSuccess(inputTokens, outputTokens, credits, 1)
-	h.pool.RecordSuccess(account.ID)
-	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-
 	// 解析 content 中的 <thinking> 标签
 	finalContent, extractedReasoning := extractThinkingFromContent(content)
-	if extractedReasoning != "" {
-		reasoningContent = extractedReasoning + reasoningContent
+	if thinking && reasoningContent == "" && extractedReasoning != "" {
+		reasoningContent = extractedReasoning
+	} else if !thinking {
+		reasoningContent = ""
 	}
+
+	inputTokens = estimatedInputTokens
+	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+
+	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.pool.RecordSuccess(account.ID)
+	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
-
-	h.appendRequestLog(RequestFinalMetrics{
-		Path:         "/v1/chat/completions",
-		Model:        model,
-		AccountID:    account.ID,
-		AccountEmail: account.Email,
-		Attempts:     1,
-		FinalStatus:  200,
-		DurationMs:   time.Since(requestStart).Milliseconds(),
-		AttemptItems: []RequestLogAttempt{{
-			Try:        1,
-			AccountID:  account.ID,
-			Email:      account.Email,
-			StatusCode: 200,
-			DurationMs: time.Since(requestStart).Milliseconds(),
-		}},
-	})
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -2080,6 +1546,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
+	case path == "/accounts/batch" && r.Method == "POST":
+		h.apiBatchAccounts(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2113,10 +1581,6 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateSettings(w, r)
 	case path == "/stats" && r.Method == "GET":
 		h.apiGetStats(w, r)
-	case path == "/request-logs" && r.Method == "GET":
-		h.apiGetRequestLogs(w, r)
-	case path == "/accounts/weight" && r.Method == "POST":
-		h.apiUpdateAccountWeight(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
@@ -2160,7 +1624,6 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"email":             a.Email,
 			"userId":            a.UserId,
 			"nickname":          a.Nickname,
-			"weight":            a.Weight,
 			"authMethod":        a.AuthMethod,
 			"provider":          a.Provider,
 			"region":            a.Region,
@@ -2171,6 +1634,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"expiresAt":         a.ExpiresAt,
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
+			"weight":            a.Weight,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -2262,16 +1726,8 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["machineId"].(string); ok {
 		existing.MachineId = v
 	}
-	if v, ok := updates["weight"]; ok {
-		switch vv := v.(type) {
-		case float64:
-			existing.Weight = int(vv)
-		case int:
-			existing.Weight = vv
-		}
-		if existing.Weight <= 0 {
-			existing.Weight = 100
-		}
+	if v, ok := updates["weight"].(float64); ok {
+		existing.Weight = int(v)
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -2282,6 +1738,95 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiBatchAccounts 批量操作账号（启用/禁用/刷新）
+func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs    []string `json:"ids"`
+		Action string   `json:"action"` // "enable", "disable", "refresh"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No account IDs provided"})
+		return
+	}
+
+	switch req.Action {
+	case "enable", "disable":
+		enabled := req.Action == "enable"
+		accounts := config.GetAccounts()
+		idSet := make(map[string]bool)
+		for _, id := range req.IDs {
+			idSet[id] = true
+		}
+		for _, a := range accounts {
+			if idSet[a.ID] {
+				a.Enabled = enabled
+				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
+					a.BanStatus = "ACTIVE"
+					a.BanReason = ""
+					a.BanTime = 0
+				}
+				config.UpdateAccount(a.ID, a)
+			}
+		}
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
+
+	case "refresh":
+		successCount := 0
+		failCount := 0
+		for _, id := range req.IDs {
+			accounts := config.GetAccounts()
+			var account *config.Account
+			for i := range accounts {
+				if accounts[i].ID == id {
+					account = &accounts[i]
+					break
+				}
+			}
+			if account == nil {
+				failCount++
+				continue
+			}
+			// 刷新 token
+			if account.RefreshToken != "" {
+				if newAccess, newRefresh, newExpires, err := auth.RefreshToken(account); err == nil {
+					account.AccessToken = newAccess
+					if newRefresh != "" {
+						account.RefreshToken = newRefresh
+					}
+					account.ExpiresAt = newExpires
+					config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
+					h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
+				}
+			}
+			// 刷新账户信息
+			info, err := RefreshAccountInfo(account)
+			if err != nil {
+				failCount++
+				continue
+			}
+			config.UpdateAccountInfo(id, *info)
+			successCount++
+		}
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"refreshed": successCount,
+			"failed":    failCount,
+		})
+
+	default:
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid action: " + req.Action})
+	}
 }
 
 func (h *Handler) apiStartIamSso(w http.ResponseWriter, r *http.Request) {
@@ -2653,21 +2198,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"accounts":              h.pool.Count(),
-		"available":             h.pool.AvailableCount(),
-		"totalRequests":         atomic.LoadInt64(&h.totalRequests),
-		"successRequests":       atomic.LoadInt64(&h.successRequests),
-		"failedRequests":        atomic.LoadInt64(&h.failedRequests),
-		"attemptFailedRequests": atomic.LoadInt64(&h.attemptFailedRequests),
-		"totalRetries":          atomic.LoadInt64(&h.totalRetries),
-		"totalTokens":           atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":          h.getCredits(),
-		"uptime":                time.Now().Unix() - h.startTime,
-		"statsDescription": map[string]string{
-			"failedRequests":        "最终失败请求数（重试后仍失败）",
-			"attemptFailedRequests": "尝试失败次数（包含重试中的失败）",
-			"totalRetries":          "总重试次数（sum(attempts-1)）",
-		},
+		"accounts":        h.pool.Count(),
+		"available":       h.pool.AvailableCount(),
+		"totalRequests":   h.totalRequests,
+		"successRequests": h.successRequests,
+		"failedRequests":  h.failedRequests,
+		"totalTokens":     h.totalTokens,
+		"totalCredits":    h.totalCredits,
+		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -2703,19 +2241,12 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"totalRequests":         atomic.LoadInt64(&h.totalRequests),
-		"successRequests":       atomic.LoadInt64(&h.successRequests),
-		"failedRequests":        atomic.LoadInt64(&h.failedRequests),
-		"attemptFailedRequests": atomic.LoadInt64(&h.attemptFailedRequests),
-		"totalRetries":          atomic.LoadInt64(&h.totalRetries),
-		"totalTokens":           atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":          h.getCredits(),
-		"uptime":                time.Now().Unix() - h.startTime,
-		"statsDescription": map[string]string{
-			"failedRequests":        "最终失败请求数（重试后仍失败）",
-			"attemptFailedRequests": "尝试失败次数（包含重试中的失败）",
-			"totalRetries":          "总重试次数（sum(attempts-1)）",
-		},
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
+		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -2723,90 +2254,12 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	atomic.StoreInt64(&h.totalRequests, 0)
 	atomic.StoreInt64(&h.successRequests, 0)
 	atomic.StoreInt64(&h.failedRequests, 0)
-	atomic.StoreInt64(&h.attemptFailedRequests, 0)
-	atomic.StoreInt64(&h.totalRetries, 0)
 	atomic.StoreInt64(&h.totalTokens, 0)
 	h.creditsMu.Lock()
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
-	config.UpdateStats(0, 0, 0, 0, 0, 0, 0)
+	config.UpdateStats(0, 0, 0, 0, 0)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
-}
-
-func (h *Handler) apiGetRequestLogs(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
-			limit = v
-		}
-	}
-	if limit > 500 {
-		limit = 500
-	}
-	items := h.requestLogs.List(limit)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"items": items,
-		"total": len(items),
-	})
-}
-
-func (h *Handler) apiUpdateAccountWeight(w http.ResponseWriter, r *http.Request) {
-	var raw map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	id, _ := raw["id"].(string)
-	if id == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
-		return
-	}
-
-	weight := 100
-	switch v := raw["weight"].(type) {
-	case float64:
-		weight = int(v)
-	case int:
-		weight = v
-	case string:
-		if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			weight = p
-		}
-	}
-	if weight <= 0 {
-		weight = 100
-	}
-	if weight > 10000 {
-		weight = 10000
-	}
-
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-
-	account.Weight = weight
-	if err := config.UpdateAccount(id, *account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": id, "weight": weight})
 }
 
 // apiGenerateMachineId 生成新的机器码
@@ -2944,42 +2397,41 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 
 	// 返回完整账号信息（包含敏感字段）
 	result := map[string]interface{}{
-		"id":                  account.ID,
-		"email":               account.Email,
-		"userId":              account.UserId,
-		"nickname":            account.Nickname,
-		"weight":              account.Weight,
-		"accessToken":         account.AccessToken,
-		"refreshToken":        account.RefreshToken,
-		"clientId":            account.ClientID,
-		"clientSecret":        account.ClientSecret,
-		"authMethod":          account.AuthMethod,
-		"provider":            account.Provider,
-		"region":              account.Region,
-		"expiresAt":           account.ExpiresAt,
-		"machineId":           account.MachineId,
-		"enabled":             account.Enabled,
-		"banStatus":           account.BanStatus,
-		"banReason":           account.BanReason,
-		"banTime":             account.BanTime,
-		"subscriptionType":    account.SubscriptionType,
-		"subscriptionTitle":   account.SubscriptionTitle,
-		"daysRemaining":       account.DaysRemaining,
-		"usageCurrent":        account.UsageCurrent,
-		"usageLimit":          account.UsageLimit,
-		"usagePercent":        account.UsagePercent,
-		"nextResetDate":       account.NextResetDate,
-		"lastRefresh":         account.LastRefresh,
-		"trialUsageCurrent":   account.TrialUsageCurrent,
-		"trialUsageLimit":     account.TrialUsageLimit,
-		"trialUsagePercent":   account.TrialUsagePercent,
-		"trialStatus":         account.TrialStatus,
-		"trialExpiresAt":      account.TrialExpiresAt,
-		"requestCount":        stats.RequestCount,
-		"errorCount":          stats.ErrorCount,
-		"totalTokens":         stats.TotalTokens,
-		"totalCredits":        stats.TotalCredits,
-		"lastUsed":            stats.LastUsed,
+		"id":                account.ID,
+		"email":             account.Email,
+		"userId":            account.UserId,
+		"nickname":          account.Nickname,
+		"accessToken":       account.AccessToken,
+		"refreshToken":      account.RefreshToken,
+		"clientId":          account.ClientID,
+		"clientSecret":      account.ClientSecret,
+		"authMethod":        account.AuthMethod,
+		"provider":          account.Provider,
+		"region":            account.Region,
+		"expiresAt":         account.ExpiresAt,
+		"machineId":         account.MachineId,
+		"enabled":           account.Enabled,
+		"banStatus":         account.BanStatus,
+		"banReason":         account.BanReason,
+		"banTime":           account.BanTime,
+		"subscriptionType":  account.SubscriptionType,
+		"subscriptionTitle": account.SubscriptionTitle,
+		"daysRemaining":     account.DaysRemaining,
+		"usageCurrent":      account.UsageCurrent,
+		"usageLimit":        account.UsageLimit,
+		"usagePercent":      account.UsagePercent,
+		"nextResetDate":     account.NextResetDate,
+		"lastRefresh":       account.LastRefresh,
+		"trialUsageCurrent": account.TrialUsageCurrent,
+		"trialUsageLimit":   account.TrialUsageLimit,
+		"trialUsagePercent": account.TrialUsagePercent,
+		"trialStatus":       account.TrialStatus,
+		"trialExpiresAt":    account.TrialExpiresAt,
+		"requestCount":      stats.RequestCount,
+		"errorCount":        stats.ErrorCount,
+		"totalTokens":       stats.TotalTokens,
+		"totalCredits":      stats.TotalCredits,
+		"lastUsed":          stats.LastUsed,
 	}
 
 	json.NewEncoder(w).Encode(result)
