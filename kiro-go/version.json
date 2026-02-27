@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
-  "changelog": "🐛 修复流式响应缺少 usage 字段 (#10)\n🚫 新增账号封禁检测，自动禁用被封账号并标记状态 (#11)\n🔄 更新模型映射列表\n🎨 管理面板显示封禁状态与原因",
+  "version": "1.0.3",
+  "changelog": "✅ 新增 clientID/clientSecret 校验\n⚖️ 新增账号权重字段，支持加权轮询策略\n🔄 批量账号管理（启用/禁用/刷新/详情）\n🚫 自动跳过用量耗尽的账号\n🔧 重构模型映射为有序列表，避免误匹配",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }

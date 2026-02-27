@@ -358,33 +358,49 @@ async def messages(
             
             # Try to parse JSON response from Kiro to extract error message
             error_message = error_text
+            error_reason = None
             try:
                 error_json = json.loads(error_text)
                 # Enhance Kiro API errors with user-friendly messages
                 from kiro.kiro_errors import enhance_kiro_error
                 error_info = enhance_kiro_error(error_json)
                 error_message = error_info.user_message
+                error_reason = error_info.reason
                 # Log original error for debugging
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
                 pass
-            
+
+            # Map Kiro error reasons to appropriate HTTP status codes
+            # CONTENT_LENGTH_EXCEEDS_THRESHOLD should return 413 (request too large)
+            final_status_code = response.status_code
+            error_type = "api_error"
+
+            if error_reason == "CONTENT_LENGTH_EXCEEDS_THRESHOLD":
+                final_status_code = 413
+                error_type = "request_too_large"
+                logger.debug(f"Mapped CONTENT_LENGTH_EXCEEDS_THRESHOLD to 413 status code")
+            elif error_reason == "MONTHLY_REQUEST_COUNT":
+                final_status_code = 429
+                error_type = "rate_limit_error"
+                logger.debug(f"Mapped MONTHLY_REQUEST_COUNT to 429 status code")
+
             # Log access log for error (before flush, so it gets into app_logs)
             logger.warning(
-                f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+                f"HTTP {final_status_code} - POST /v1/messages - {error_message[:100]}"
             )
-            
+
             # Flush debug logs on error
             if debug_logger:
-                debug_logger.flush_on_error(response.status_code, error_message)
-            
+                debug_logger.flush_on_error(final_status_code, error_message)
+
             # Return error in Anthropic format
             return JSONResponse(
-                status_code=response.status_code,
+                status_code=final_status_code,
                 content={
                     "type": "error",
                     "error": {
-                        "type": "api_error",
+                        "type": error_type,
                         "message": error_message
                     }
                 }

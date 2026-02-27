@@ -373,40 +373,85 @@ def inject_thinking_tags(content: str) -> str:
 def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Sanitizes JSON Schema from fields that Kiro API doesn't accept.
-    
+
     Kiro API returns 400 "Improperly formed request" error if:
-    - required is an empty array []
+    - required is an empty array [] or null
+    - properties is null
+    - type is missing or null
     - additionalProperties is present in schema
-    
-    This function recursively processes the schema and removes problematic fields.
-    
+
+    This function recursively processes the schema and normalizes problematic fields.
+    Based on kiro.rs normalize_json_schema implementation.
+
     Args:
         schema: JSON Schema to sanitize
-    
+
     Returns:
-        Sanitized copy of schema
+        Sanitized copy of schema with normalized fields
     """
     if not schema:
-        return {}
-    
+        # Return minimal valid schema for null/empty input
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": True
+        }
+
+    if not isinstance(schema, dict):
+        # Non-dict schema, return minimal valid schema
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": True
+        }
+
     result = {}
-    
+
     for key, value in schema.items():
-        # Skip empty required arrays
-        if key == "required" and isinstance(value, list) and len(value) == 0:
+        # Normalize type field - must be a non-empty string
+        if key == "type":
+            if isinstance(value, str) and value.strip():
+                result[key] = value
+            else:
+                result[key] = "object"
             continue
-        
-        # Skip additionalProperties - Kiro API doesn't support it
+
+        # Normalize properties field - must be an object, not null
+        if key == "properties":
+            if isinstance(value, dict):
+                result[key] = {
+                    prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
+                    for prop_name, prop_value in value.items()
+                }
+            else:
+                # properties is null or invalid, use empty object
+                result[key] = {}
+            continue
+
+        # Normalize required field - must be array of strings, not null or empty
+        if key == "required":
+            if isinstance(value, list):
+                # Filter to only string values
+                string_values = [v for v in value if isinstance(v, str)]
+                if string_values:
+                    result[key] = string_values
+                # Skip empty arrays (don't add to result)
+            # Skip null or non-list values (don't add to result)
+            continue
+
+        # Normalize additionalProperties - allow bool or object, skip others
         if key == "additionalProperties":
+            if isinstance(value, (bool, dict)):
+                result[key] = value
+            else:
+                # Invalid value, use True as default
+                result[key] = True
             continue
-        
+
         # Recursively process nested objects
-        if key == "properties" and isinstance(value, dict):
-            result[key] = {
-                prop_name: sanitize_json_schema(prop_value) if isinstance(prop_value, dict) else prop_value
-                for prop_name, prop_value in value.items()
-            }
-        elif isinstance(value, dict):
+        if isinstance(value, dict):
             result[key] = sanitize_json_schema(value)
         elif isinstance(value, list):
             # Process lists (e.g., anyOf, oneOf)
@@ -416,7 +461,15 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             ]
         else:
             result[key] = value
-    
+
+    # Ensure type field exists
+    if "type" not in result:
+        result["type"] = "object"
+
+    # Ensure properties field exists for object types
+    if result.get("type") == "object" and "properties" not in result:
+        result["properties"] = {}
+
     return result
 
 
@@ -926,22 +979,155 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
     return result, had_tool_content
 
 
+def validate_and_clean_tool_pairing(messages: List[UnifiedMessage]) -> List[UnifiedMessage]:
+    """
+    Validates and cleans tool_use/tool_result pairing in messages.
+
+    Kiro API requires:
+    1. Every tool_use must have a corresponding tool_result
+    2. Every tool_result must have a corresponding tool_use
+
+    This function:
+    - Collects all tool_use_ids from assistant messages
+    - Collects all tool_result_ids from user messages
+    - Removes orphaned tool_uses (no matching tool_result)
+    - Converts orphaned tool_results to text (no matching tool_use)
+
+    Based on kiro.rs validate_tool_pairing and remove_orphaned_tool_uses implementation.
+
+    Args:
+        messages: List of messages in unified format
+
+    Returns:
+        List of messages with validated and cleaned tool pairing
+    """
+    if not messages:
+        return []
+
+    # Step 1: Collect all tool_use_ids and tool_result_ids
+    all_tool_use_ids = set()
+    all_tool_result_ids = set()
+
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_id = tc.get("id", "")
+                if tool_id:
+                    all_tool_use_ids.add(tool_id)
+
+        if msg.role == "user" and msg.tool_results:
+            for tr in msg.tool_results:
+                tool_use_id = tr.get("tool_use_id", "")
+                if tool_use_id:
+                    all_tool_result_ids.add(tool_use_id)
+
+    # Step 2: Find orphaned tool_uses and tool_results
+    orphaned_tool_use_ids = all_tool_use_ids - all_tool_result_ids
+    orphaned_tool_result_ids = all_tool_result_ids - all_tool_use_ids
+
+    # Log warnings for orphaned items
+    if orphaned_tool_use_ids:
+        logger.warning(
+            f"Found {len(orphaned_tool_use_ids)} orphaned tool_use(s) without matching tool_result, "
+            f"will remove from messages. IDs: {list(orphaned_tool_use_ids)[:5]}"
+        )
+
+    if orphaned_tool_result_ids:
+        logger.warning(
+            f"Found {len(orphaned_tool_result_ids)} orphaned tool_result(s) without matching tool_use, "
+            f"will convert to text. IDs: {list(orphaned_tool_result_ids)[:5]}"
+        )
+
+    # Step 3: Process messages and clean up
+    result = []
+
+    for msg in messages:
+        # Handle assistant messages - remove orphaned tool_uses
+        if msg.role == "assistant" and msg.tool_calls and orphaned_tool_use_ids:
+            original_count = len(msg.tool_calls)
+            cleaned_tool_calls = [
+                tc for tc in msg.tool_calls
+                if tc.get("id", "") not in orphaned_tool_use_ids
+            ]
+
+            if len(cleaned_tool_calls) < original_count:
+                logger.debug(
+                    f"Removed {original_count - len(cleaned_tool_calls)} orphaned tool_use(s) "
+                    f"from assistant message"
+                )
+
+                # Create cleaned message
+                cleaned_msg = UnifiedMessage(
+                    role=msg.role,
+                    content=msg.content,
+                    tool_calls=cleaned_tool_calls if cleaned_tool_calls else None,
+                    tool_results=msg.tool_results,
+                    images=msg.images
+                )
+                result.append(cleaned_msg)
+                continue
+
+        # Handle user messages - convert orphaned tool_results to text
+        if msg.role == "user" and msg.tool_results and orphaned_tool_result_ids:
+            orphaned_results = [
+                tr for tr in msg.tool_results
+                if tr.get("tool_use_id", "") in orphaned_tool_result_ids
+            ]
+            valid_results = [
+                tr for tr in msg.tool_results
+                if tr.get("tool_use_id", "") not in orphaned_tool_result_ids
+            ]
+
+            if orphaned_results:
+                logger.debug(
+                    f"Converting {len(orphaned_results)} orphaned tool_result(s) to text "
+                    f"in user message"
+                )
+
+                # Convert orphaned tool_results to text
+                orphaned_text = tool_results_to_text(orphaned_results)
+
+                # Append to existing content
+                original_content = extract_text_content(msg.content) or ""
+                if original_content and orphaned_text:
+                    new_content = f"{original_content}\n\n{orphaned_text}"
+                elif orphaned_text:
+                    new_content = orphaned_text
+                else:
+                    new_content = original_content
+
+                # Create cleaned message
+                cleaned_msg = UnifiedMessage(
+                    role=msg.role,
+                    content=new_content,
+                    tool_calls=msg.tool_calls,
+                    tool_results=valid_results if valid_results else None,
+                    images=msg.images
+                )
+                result.append(cleaned_msg)
+                continue
+
+        result.append(msg)
+
+    return result
+
+
 def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tuple[List[UnifiedMessage], bool]:
     """
     Ensures that messages with tool_results have a preceding assistant message with tool_calls.
-    
+
     Kiro API requires that when toolResults are present, there must be a preceding
     assistantResponseMessage with toolUses. Some clients (like Cline/Roo/Cursor) may send
     truncated conversations where the assistant message is missing.
-    
+
     Since we don't know the original tool name and arguments when the assistant message
     is missing, we cannot create a valid synthetic assistant message. Instead, we convert
     the tool_results to text representation and append to the message content, preserving
     the context for the model while avoiding Kiro API rejection.
-    
+
     Args:
         messages: List of messages in unified format
-    
+
     Returns:
         Tuple of:
         - List of messages with orphaned tool_results converted to text
@@ -949,10 +1135,10 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
     """
     if not messages:
         return [], False
-    
+
     result = []
     converted_any_tool_results = False
-    
+
     for msg in messages:
         # Check if this message has tool_results
         if msg.tool_results:
@@ -962,7 +1148,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                 result[-1].role == "assistant" and
                 result[-1].tool_calls
             )
-            
+
             if not has_preceding_assistant:
                 # We cannot create a valid synthetic assistant message because we don't know
                 # the original tool name and arguments. Kiro API validates tool names.
@@ -972,10 +1158,10 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     f"(no preceding assistant message with tool_calls). "
                     f"Tool IDs: {[tr.get('tool_use_id', 'unknown') for tr in msg.tool_results]}"
                 )
-                
+
                 # Convert tool_results to text representation
                 tool_results_text = tool_results_to_text(msg.tool_results)
-                
+
                 # Append to existing content
                 original_content = extract_text_content(msg.content) or ""
                 if original_content and tool_results_text:
@@ -984,7 +1170,7 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     new_content = tool_results_text
                 else:
                     new_content = original_content
-                
+
                 # Create a copy of the message with tool_results converted to text
                 cleaned_msg = UnifiedMessage(
                     role=msg.role,
@@ -996,9 +1182,9 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
                 continue
-        
+
         result.append(msg)
-    
+
     return result, converted_any_tool_results
 
 
@@ -1395,9 +1581,13 @@ def build_kiro_payload(
         messages_with_assistants = messages_without_tools
         converted_tool_results = had_tool_content
     else:
+        # Validate and clean tool_use/tool_result pairing (Kiro API requirement)
+        # Remove orphaned tool_uses and convert orphaned tool_results to text
+        messages_cleaned = validate_and_clean_tool_pairing(messages)
+
         # Ensure assistant messages exist before tool_results (Kiro API requirement)
         # Also returns flag if any tool_results were converted (to skip thinking tag injection)
-        messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages)
+        messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages_cleaned)
     
     # Merge adjacent messages with the same role
     merged_messages = merge_adjacent_messages(messages_with_assistants)

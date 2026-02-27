@@ -9,13 +9,14 @@ import (
 	"io"
 	"kiro-api-proxy/config"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-const KiroVersion = "0.6.18"
+const KiroVersion = "0.7.45"
 
 // 双端点配置（429 时自动 fallback）
 type kiroEndpoint struct {
@@ -70,7 +71,7 @@ type KiroPayload struct {
 
 type KiroUserInputMessage struct {
 	Content                 string                   `json:"content"`
-	ModelID                 string                   `json:"modelId,omitempty"`
+	ModelID                 string                   `json:"modelId"`
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
@@ -159,23 +160,19 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 // CallKiroAPI 调用 Kiro API（流式），双端点自动 fallback
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
+	if _, err := json.Marshal(payload); err != nil {
 		return err
 	}
-
-	// 预估输入 token（约 3 字符 = 1 token）
-	estimatedInputTokens := max(1, len(body)/3)
 
 	// User-Agent
 	machineId := account.MachineId
 	var userAgent, amzUserAgent string
 	if machineId != "" {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.18 ua/2.1 os/linux lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-%s-%s", KiroVersion, machineId)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.18 KiroIDE %s %s", KiroVersion, machineId)
+		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s-%s", KiroVersion, machineId)
+		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s %s", KiroVersion, machineId)
 	} else {
-		userAgent = fmt.Sprintf("aws-sdk-js/1.0.18 ua/2.1 os/linux lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-%s", KiroVersion)
-		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.18 KiroIDE %s", KiroVersion)
+		userAgent = fmt.Sprintf("aws-sdk-js/1.0.27 ua/2.1 os/linux lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-%s", KiroVersion)
+		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", KiroVersion)
 	}
 
 	// 根据配置排序端点
@@ -198,7 +195,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("X-Amz-Target", ep.AmzTarget)
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("X-Amz-User-Agent", amzUserAgent)
-		req.Header.Set("x-amzn-kiro-agent-mode", "spec")
+		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 		req.Header.Set("x-amzn-codewhisperer-optout", "true")
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
@@ -230,7 +227,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback, estimatedInputTokens)
+		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
 		return err
 	}
@@ -244,12 +241,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 // ==================== Event Stream 解析 ====================
 
 // parseEventStream 解析 AWS Event Stream 二进制格式
-func parseEventStream(body io.Reader, callback *KiroStreamCallback, estimatedInputTokens int) error {
+func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// 不使用 bufio，直接读取避免缓冲延迟
 	var inputTokens, outputTokens int
-	var totalOutputChars int
 	var totalCredits float64
 	var currentToolUse *toolUseState
+	var lastAssistantContent string
+	var lastReasoningContent string
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -292,44 +290,31 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, estimatedInp
 			continue
 		}
 
+		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+
 		// 处理事件
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
-				callback.OnText(content, false)
-				totalOutputChars += len(content)
+				normalized := normalizeChunk(content, &lastAssistantContent)
+				if normalized != "" {
+					callback.OnText(normalized, false)
+				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
-				callback.OnText(text, true)
-				totalOutputChars += len(text)
+				normalized := normalizeChunk(text, &lastReasoningContent)
+				if normalized != "" {
+					callback.OnText(normalized, true)
+				}
 			}
 		case "toolUseEvent":
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
-		case "messageMetadataEvent", "metadataEvent":
-			if tokenUsage, ok := event["tokenUsage"].(map[string]interface{}); ok {
-				if v, ok := tokenUsage["outputTokens"].(float64); ok {
-					outputTokens = int(v)
-				}
-				uncached, _ := tokenUsage["uncachedInputTokens"].(float64)
-				cacheRead, _ := tokenUsage["cacheReadInputTokens"].(float64)
-				cacheWrite, _ := tokenUsage["cacheWriteInputTokens"].(float64)
-				inputTokens = int(uncached + cacheRead + cacheWrite)
-			}
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
 		}
-	}
-
-	// 估算 token（约 3 字符 = 1 token）
-	if outputTokens == 0 && totalOutputChars > 0 {
-		outputTokens = max(1, totalOutputChars/3)
-	}
-	// 如果 Kiro 没返回 inputTokens，使用预估值
-	if inputTokens == 0 {
-		inputTokens = estimatedInputTokens
 	}
 
 	if callback.OnCredits != nil && totalCredits > 0 {
@@ -338,6 +323,152 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback, estimatedInp
 
 	callback.OnComplete(inputTokens, outputTokens)
 	return nil
+}
+
+func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
+	candidates := []map[string]interface{}{event}
+	collectUsageMaps(event, &candidates)
+
+	inputTokens := currentInputTokens
+	outputTokens := currentOutputTokens
+
+	for _, usage := range candidates {
+		if usage == nil {
+			continue
+		}
+
+		if v, ok := readTokenNumber(usage,
+			"outputTokens", "completionTokens", "totalOutputTokens",
+			"output_tokens", "completion_tokens", "total_output_tokens",
+		); ok {
+			outputTokens = v
+		}
+
+		if v, ok := readTokenNumber(usage,
+			"inputTokens", "promptTokens", "totalInputTokens",
+			"input_tokens", "prompt_tokens", "total_input_tokens",
+		); ok {
+			inputTokens = v
+			continue
+		}
+
+		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
+		cacheRead, _ := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens")
+		cacheWrite, _ := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
+		if uncached+cacheRead+cacheWrite > 0 {
+			inputTokens = uncached + cacheRead + cacheWrite
+			continue
+		}
+
+		total, ok := readTokenNumber(usage, "totalTokens", "total_tokens")
+		if ok && total > 0 {
+			candidateOutput := outputTokens
+			if v, vok := readTokenNumber(usage,
+				"outputTokens", "completionTokens", "totalOutputTokens",
+				"output_tokens", "completion_tokens", "total_output_tokens",
+			); vok {
+				candidateOutput = v
+			}
+			if total-candidateOutput > 0 {
+				inputTokens = total - candidateOutput
+			}
+		}
+	}
+
+	return inputTokens, outputTokens
+}
+
+func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, child := range t {
+			lk := strings.ToLower(k)
+			if lk == "usage" || lk == "tokenusage" || lk == "token_usage" {
+				if m, ok := child.(map[string]interface{}); ok {
+					*out = append(*out, m)
+				}
+			}
+			collectUsageMaps(child, out)
+		}
+	case []interface{}:
+		for _, child := range t {
+			collectUsageMaps(child, out)
+		}
+	}
+}
+
+func normalizeChunk(chunk string, previous *string) string {
+	if chunk == "" {
+		return ""
+	}
+
+	prev := *previous
+	if prev == "" {
+		*previous = chunk
+		return chunk
+	}
+
+	if chunk == prev {
+		return ""
+	}
+
+	if strings.HasPrefix(chunk, prev) {
+		delta := chunk[len(prev):]
+		*previous = chunk
+		return delta
+	}
+
+	if strings.HasPrefix(prev, chunk) {
+		return ""
+	}
+
+	maxOverlap := 0
+	maxLen := len(prev)
+	if len(chunk) < maxLen {
+		maxLen = len(chunk)
+	}
+	for i := maxLen; i > 0; i-- {
+		if strings.HasSuffix(prev, chunk[:i]) {
+			maxOverlap = i
+			break
+		}
+	}
+
+	*previous = chunk
+	if maxOverlap > 0 {
+		return chunk[maxOverlap:]
+	}
+
+	return chunk
+}
+
+func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
+	for _, k := range keys {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch n := v.(type) {
+		case float64:
+			return int(n), true
+		case int:
+			return n, true
+		case int64:
+			return int(n), true
+		case json.Number:
+			if parsed, err := n.Int64(); err == nil {
+				return int(parsed), true
+			}
+		case string:
+			if parsed, err := strconv.Atoi(n); err == nil {
+				return parsed, true
+			}
+			if parsed, err := strconv.ParseFloat(n, 64); err == nil {
+				return int(parsed), true
+			}
+		}
+	}
+	return 0, false
 }
 
 // ==================== Tool Use 处理 ====================

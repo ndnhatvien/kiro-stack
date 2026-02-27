@@ -1,26 +1,21 @@
 // Package pool 账号池管理
-// 实现随机负载均衡、错误冷却、Token 刷新
+// 实现轮询负载均衡、错误冷却、Token 刷新
 package pool
 
 import (
 	"kiro-api-proxy/config"
-	"math/rand"
-	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
-)
-
-const (
-	primaryUsageThreshold = 10
-	topCandidateLimit     = 3
 )
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu          sync.RWMutex
-	accounts    []config.Account
-	cooldowns   map[string]time.Time // 账号冷却时间
-	errorCounts map[string]int       // 连续错误计数
+	mu           sync.RWMutex
+	accounts     []config.Account
+	currentIndex uint64
+	cooldowns    map[string]time.Time // 账号冷却时间
+	errorCounts  map[string]int       // 连续错误计数
 }
 
 var (
@@ -41,13 +36,25 @@ func GetPool() *AccountPool {
 }
 
 // Reload 从配置重新加载账号
+// 构建加权列表：weight<=1 出现 1 次，weight>=2 出现 weight 次
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.accounts = config.GetEnabledAccounts()
+	enabled := config.GetEnabledAccounts()
+	var weighted []config.Account
+	for _, a := range enabled {
+		w := a.Weight
+		if w < 1 {
+			w = 1
+		}
+		for j := 0; j < w; j++ {
+			weighted = append(weighted, a)
+		}
+	}
+	p.accounts = weighted
 }
 
-// GetNext 获取一个可用账号：主池/兜底池 +（排序优先后的）组内加权随机
+// GetNext 获取下一个可用账号（加权轮询）
 func (p *AccountPool) GetNext() *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -57,42 +64,48 @@ func (p *AccountPool) GetNext() *config.Account {
 	}
 
 	now := time.Now()
-	primary := make([]*config.Account, 0, len(p.accounts))
-	fallback := make([]*config.Account, 0, len(p.accounts))
+	n := len(p.accounts)
+	seen := make(map[string]bool)
 
-	for i := range p.accounts {
-		acc := &p.accounts[i]
+	// 加权轮询查找可用账号
+	for i := 0; i < n; i++ {
+		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		acc := &p.accounts[idx]
+
+		if seen[acc.ID] {
+			continue
+		}
 
 		// 跳过冷却中的账号
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			seen[acc.ID] = true
 			continue
 		}
 
 		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-300 {
+		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
+			seen[acc.ID] = true
 			continue
 		}
 
-		if acc.UsageCurrent >= primaryUsageThreshold {
-			primary = append(primary, acc)
-		} else {
-			fallback = append(fallback, acc)
+		// 跳过额度已用尽的账号（适用于所有订阅类型）
+		if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
+			seen[acc.ID] = true
+			continue
 		}
+
+		return acc
 	}
 
-	picked := pickWeightedWithRanking(primary)
-	if picked == nil {
-		picked = pickWeightedWithRanking(fallback)
-	}
-	if picked != nil {
-		return picked
-	}
-
-	// 无可用账号，返回冷却时间最短的
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
 		acc := &p.accounts[i]
+		// 额度用尽的账号不作为 fallback
+		if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
+			continue
+		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
 			if best == nil || cooldown.Before(earliest) {
 				best = acc
@@ -103,53 +116,6 @@ func (p *AccountPool) GetNext() *config.Account {
 		}
 	}
 	return best
-}
-
-func pickWeightedWithRanking(candidates []*config.Account) *config.Account {
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// 先按积分(usageCurrent) / 更新时间(lastRefresh)排序
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].UsageCurrent == candidates[j].UsageCurrent {
-			return candidates[i].LastRefresh > candidates[j].LastRefresh
-		}
-		return candidates[i].UsageCurrent > candidates[j].UsageCurrent
-	})
-
-	// 只在前N个候选里按权重随机，兼顾“优先”与“分流”
-	limit := topCandidateLimit
-	if len(candidates) < limit {
-		limit = len(candidates)
-	}
-	top := candidates[:limit]
-
-	totalWeight := 0
-	for _, a := range top {
-		w := a.Weight
-		if w <= 0 {
-			w = 100
-		}
-		totalWeight += w
-	}
-
-	if totalWeight <= 0 {
-		return top[rand.Intn(len(top))]
-	}
-
-	r := rand.Intn(totalWeight)
-	for _, a := range top {
-		w := a.Weight
-		if w <= 0 {
-			w = 100
-		}
-		r -= w
-		if r < 0 {
-			return a
-		}
-	}
-	return top[len(top)-1]
 }
 
 // GetByID 根据 ID 获取账号
@@ -204,11 +170,15 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 	}
 }
 
-// Count 返回账号总数
+// Count 返回账号总数（去重后的唯一账号数）
 func (p *AccountPool) Count() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return len(p.accounts)
+	seen := make(map[string]bool)
+	for _, acc := range p.accounts {
+		seen[acc.ID] = true
+	}
+	return len(seen)
 }
 
 // AvailableCount 返回可用账号数

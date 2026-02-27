@@ -10,37 +10,46 @@ import (
 	"github.com/google/uuid"
 )
 
-// 模型映射
-var modelMap = map[string]string{
-	"claude-sonnet-4-6":        "claude-sonnet-4.6",
-	"claude-sonnet-4.6":        "claude-sonnet-4.6",
-	"claude-haiku-4-5":         "claude-haiku-4.5",
-	"claude-haiku-4.5":         "claude-haiku-4.5",
-	"claude-opus-4-6":         "claude-opus-4.6",
-	"claude-opus-4.6":         "claude-opus-4.6",
-	"claude-opus-4-5":          "claude-opus-4.5",
-	"claude-opus-4.5":          "claude-opus-4.5",
-	"claude-sonnet-4":          "claude-sonnet-4",
-	"claude-sonnet-4-20250514": "claude-sonnet-4",
-	"claude-3-5-sonnet":        "claude-sonnet-4.5",
-	"claude-3-opus":            "claude-sonnet-4.5",
-	"claude-3-sonnet":          "claude-sonnet-4",
-	"claude-3-haiku":           "claude-haiku-4.5",
-	"gpt-4":                    "claude-sonnet-4.5",
-	"gpt-4o":                   "claude-sonnet-4.5",
-	"gpt-4-turbo":              "claude-sonnet-4.5",
-	"gpt-3.5-turbo":            "claude-sonnet-4.5",
+// 模型映射（有序，长 key 优先匹配，避免 "claude-sonnet-4" 误匹配 "claude-sonnet-4.5"）
+type modelMapping struct {
+	key   string
+	value string
+}
+
+var modelMapOrdered = []modelMapping{
+	{"claude-sonnet-4-20250514", "claude-sonnet-4"},
+	{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+	{"claude-sonnet-4.5", "claude-sonnet-4.5"},
+	{"claude-sonnet-4-6", "claude-sonnet-4.6"},
+	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
+	{"claude-haiku-4-5", "claude-haiku-4.5"},
+	{"claude-haiku-4.5", "claude-haiku-4.5"},
+	{"claude-opus-4-5", "claude-opus-4.5"},
+	{"claude-opus-4.5", "claude-opus-4.5"},
+	{"claude-opus-4-6", "claude-opus-4.6"},
+	{"claude-opus-4.6", "claude-opus-4.6"},
+	{"claude-sonnet-4", "claude-sonnet-4"},
+	{"claude-3-5-sonnet", "claude-sonnet-4.5"},
+	{"claude-3-opus", "claude-sonnet-4.5"},
+	{"claude-3-sonnet", "claude-sonnet-4"},
+	{"claude-3-haiku", "claude-haiku-4.5"},
+	{"gpt-4-turbo", "claude-sonnet-4.5"},
+	{"gpt-4o", "claude-sonnet-4.5"},
+	{"gpt-4", "claude-sonnet-4.5"},
+	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+const minimalFallbackUserContent = "."
+
 // ParseModelAndThinking 解析模型名称，返回实际模型和是否启用 thinking
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
-	
+
 	// 使用配置的后缀检查
 	suffixLower := strings.ToLower(thinkingSuffix)
 	if strings.HasSuffix(lower, suffixLower) {
@@ -48,19 +57,19 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
 	}
-	
-	// 映射模型
-	for k, v := range modelMap {
-		if strings.Contains(lower, k) {
-			return v, thinking
+
+	// 映射模型（有序匹配，长 key 优先）
+	for _, m := range modelMapOrdered {
+		if strings.Contains(lower, m.key) {
+			return m.value, thinking
 		}
 	}
-	
+
 	// 如果已经是有效的 Kiro 模型，直接返回
 	if strings.HasPrefix(lower, "claude-") {
 		return model, thinking
 	}
-	
+
 	return "claude-sonnet-4.5", thinking
 }
 
@@ -89,13 +98,14 @@ type ClaudeMessage struct {
 }
 
 type ClaudeContentBlock struct {
-	Type      string      `json:"type"`
-	Text      string      `json:"text,omitempty"`
-	ID        string      `json:"id,omitempty"`
-	Name      string      `json:"name,omitempty"`
-	Input     interface{} `json:"input,omitempty"`
-	ToolUseID string      `json:"tool_use_id,omitempty"`
-	Content   interface{} `json:"content,omitempty"` // for tool_result
+	Type      string       `json:"type"`
+	Text      string       `json:"text,omitempty"`
+	Thinking  string       `json:"thinking,omitempty"`
+	ID        string       `json:"id,omitempty"`
+	Name      string       `json:"name,omitempty"`
+	Input     interface{}  `json:"input,omitempty"`
+	ToolUseID string       `json:"tool_use_id,omitempty"`
+	Content   interface{}  `json:"content,omitempty"` // for tool_result
 	Source    *ImageSource `json:"source,omitempty"`
 }
 
@@ -137,29 +147,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := extractSystemPrompt(req.System)
-	
+
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
 	}
-	
-	// 注入时间戳
-	timestamp := time.Now().Format(time.RFC3339)
-	systemPrompt = "[Context: Current time is " + timestamp + "]\n\n" + systemPrompt
-
-	// 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-	executionDirective := `
-<execution_discipline>
-当用户要求执行特定任务时，你必须遵循以下纪律：
-1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
-2. **行动优先**：优先执行任务而非仅分析或总结，除非用户明确只要求分析
-3. **计划执行**：为任务创建明确的步骤计划，逐步执行并标记完成状态
-4. **禁止确认性收尾**：在任务未完成前，禁止输出"需要我继续吗？"、"需要深入分析吗？"等确认性问题
-5. **持续推进**：如果发现部分任务已完成，立即继续执行剩余未完成的任务
-6. **完整交付**：直到所有任务步骤都执行完毕才算完成
-</execution_discipline>
-`
-	systemPrompt = systemPrompt + "\n\n" + executionDirective
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -172,7 +164,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			
+			content = normalizeUserContent(content, len(images) > 0)
+
 			if isLast {
 				currentContent = content
 				currentImages = images
@@ -224,10 +217,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 	if currentContent != "" {
 		finalContent += currentContent
+	} else if len(currentImages) > 0 {
+		finalContent += normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
-		finalContent += "Tool results provided."
+		finalContent += buildToolResultsContinuation(currentToolResults)
 	} else {
-		finalContent += "Continue"
+		finalContent += minimalFallbackUserContent
 	}
 
 	// 转换工具
@@ -236,7 +231,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = uuid.New().String()
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -305,24 +300,13 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 
 			blockType, _ := block["type"].(string)
 			switch blockType {
-			case "text":
+			case "text", "input_text":
 				if t, ok := block["text"].(string); ok {
 					text += t
 				}
-			case "image":
-				if source, ok := block["source"].(map[string]interface{}); ok {
-					mediaType, _ := source["media_type"].(string)
-					data, _ := source["data"].(string)
-					format := strings.TrimPrefix(mediaType, "image/")
-					if format == "jpg" {
-						format = "jpeg"
-					}
-					images = append(images, KiroImage{
-						Format: format,
-						Source: struct {
-							Bytes string `json:"bytes"`
-						}{Bytes: data},
-					})
+			case "image", "image_url", "input_image":
+				if img := extractImageFromClaudeBlock(block); img != nil {
+					images = append(images, *img)
 				}
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
@@ -337,6 +321,44 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 	}
 
 	return text, images, toolResults
+}
+
+func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
+	if source, ok := block["source"].(map[string]interface{}); ok {
+		if data, ok := source["data"].(string); ok {
+			if img := parseDataURL(data); img != nil {
+				return img
+			}
+			mediaType, _ := source["media_type"].(string)
+			if mediaType == "" {
+				mediaType, _ = source["mediaType"].(string)
+			}
+			if mediaType == "" {
+				mediaType, _ = source["mime_type"].(string)
+			}
+			format := strings.TrimPrefix(strings.ToLower(mediaType), "image/")
+			if img := parseBase64Image(data, format); img != nil {
+				return img
+			}
+		}
+		if url, ok := source["url"].(string); ok {
+			if img := parseDataURL(url); img != nil {
+				return img
+			}
+		}
+	}
+
+	if img := extractImageFromOpenAIPart(block); img != nil {
+		return img
+	}
+
+	if data, ok := block["data"].(string); ok {
+		if img := parseDataURL(data); img != nil {
+			return img
+		}
+	}
+
+	return nil
 }
 
 func extractToolResultContent(content interface{}) string {
@@ -394,10 +416,6 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		}
 	}
 
-	if text == "" && len(toolUses) > 0 {
-		text = "Using tools."
-	}
-
 	return text, toolUses
 }
 
@@ -439,8 +457,15 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+func KiroToClaudeResponse(content, thinkingContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
+
+	if thinkingContent != "" {
+		blocks = append(blocks, ClaudeContentBlock{
+			Type:     "thinking",
+			Thinking: thinkingContent,
+		})
+	}
 
 	if content != "" {
 		blocks = append(blocks, ClaudeContentBlock{
@@ -547,7 +572,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
-			if s, ok := msg.Content.(string); ok {
+			if s := extractOpenAIMessageText(msg.Content); s != "" {
 				systemPrompt += s + "\n"
 			}
 		} else {
@@ -559,24 +584,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if thinking {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
 	}
-
-	// 注入时间戳
-	timestamp := time.Now().Format(time.RFC3339)
-	systemPrompt = "[Context: Current time is " + timestamp + "]\n\n" + systemPrompt
-
-	// 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-	executionDirective := `
-<execution_discipline>
-当用户要求执行特定任务时，你必须遵循以下纪律：
-1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
-2. **行动优先**：优先执行任务而非仅分析或总结，除非用户明确只要求分析
-3. **计划执行**：为任务创建明确的步骤计划，逐步执行并标记完成状态
-4. **禁止确认性收尾**：在任务未完成前，禁止输出"需要我继续吗？"、"需要深入分析吗？"等确认性问题
-5. **持续推进**：如果发现部分任务已完成，立即继续执行剩余未完成的任务
-6. **完整交付**：直到所有任务步骤都执行完毕才算完成
-</execution_discipline>
-`
-	systemPrompt = systemPrompt + "\n\n" + executionDirective
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -591,7 +598,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		switch msg.Role {
 		case "user":
 			content, images := extractOpenAIUserContent(msg.Content)
-			
+			content = normalizeUserContent(content, len(images) > 0)
+
 			// 第一条 user 消息合并 system prompt
 			if !systemMerged && systemPrompt != "" {
 				content = systemPrompt + "\n" + content
@@ -613,11 +621,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			}
 
 		case "assistant":
-			content, _ := msg.Content.(string)
-			if content == "" && len(msg.ToolCalls) > 0 {
-				content = "Using tools."
-			}
-			
+			content := extractOpenAIMessageText(msg.Content)
+
 			var toolUses []KiroToolUse
 			for _, tc := range msg.ToolCalls {
 				var input map[string]interface{}
@@ -640,7 +645,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			})
 
 		case "tool":
-			content, _ := msg.Content.(string)
+			content := extractOpenAIMessageText(msg.Content)
 			currentToolResults = append(currentToolResults, KiroToolResult{
 				ToolUseID: msg.ToolCallID,
 				Content:   []KiroResultContent{{Text: content}},
@@ -653,7 +658,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 				if !isLast {
 					history = append(history, KiroHistoryMessage{
 						UserInputMessage: &KiroUserInputMessage{
-							Content: "Tool results provided.",
+							Content: buildToolResultsContinuation(currentToolResults),
 							ModelID: modelID,
 							Origin:  origin,
 							UserInputMessageContext: &UserInputMessageContext{
@@ -670,10 +675,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := currentContent
 	if finalContent == "" {
-		if len(currentToolResults) > 0 {
-			finalContent = "Tool results provided."
+		if len(currentImages) > 0 {
+			finalContent = normalizeUserContent("", true)
+		} else if len(currentToolResults) > 0 {
+			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
-			finalContent = "Continue"
+			finalContent = minimalFallbackUserContent
 		}
 	}
 	if !systemMerged && systemPrompt != "" {
@@ -686,7 +693,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = uuid.New().String()
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -724,6 +731,15 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 	var text string
 	var images []KiroImage
 
+	if part, ok := content.(map[string]interface{}); ok {
+		if t, ok := extractOpenAITextPart(part); ok {
+			text += t
+		}
+		if img := extractImageFromOpenAIPart(part); img != nil {
+			images = append(images, *img)
+		}
+	}
+
 	if parts, ok := content.([]interface{}); ok {
 		for _, p := range parts {
 			part, ok := p.(map[string]interface{})
@@ -731,50 +747,301 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 				continue
 			}
 
-			partType, _ := part["type"].(string)
-			switch partType {
-			case "text":
-				if t, ok := part["text"].(string); ok {
-					text += t
-				}
-			case "image_url":
-				if imgUrl, ok := part["image_url"].(map[string]interface{}); ok {
-					if url, ok := imgUrl["url"].(string); ok {
-						if img := parseDataURL(url); img != nil {
-							images = append(images, *img)
-						}
-					}
-				}
+			if t, ok := extractOpenAITextPart(part); ok {
+				text += t
+			}
+			if img := extractImageFromOpenAIPart(part); img != nil {
+				images = append(images, *img)
 			}
 		}
+	}
+
+	if len(images) > 0 {
+		text = sanitizeImagePlaceholders(text)
 	}
 
 	return text, images
 }
 
+func extractOpenAIMessageText(content interface{}) string {
+	if content == nil {
+		return ""
+	}
+
+	if s, ok := content.(string); ok {
+		return s
+	}
+
+	if text, _ := extractOpenAIUserContent(content); strings.TrimSpace(text) != "" {
+		return text
+	}
+
+	switch v := content.(type) {
+	case map[string]interface{}:
+		if nested, ok := v["content"]; ok {
+			if nestedText := extractOpenAIMessageText(nested); strings.TrimSpace(nestedText) != "" {
+				return nestedText
+			}
+		}
+		if raw, err := json.Marshal(v); err == nil {
+			return string(raw)
+		}
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			partText := extractOpenAIMessageText(item)
+			if strings.TrimSpace(partText) != "" {
+				parts = append(parts, partText)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "")
+		}
+		if raw, err := json.Marshal(v); err == nil {
+			return string(raw)
+		}
+	default:
+		if raw, err := json.Marshal(v); err == nil {
+			return string(raw)
+		}
+	}
+
+	return ""
+}
+
+func buildToolResultsContinuation(toolResults []KiroToolResult) string {
+	if len(toolResults) == 0 {
+		return minimalFallbackUserContent
+	}
+
+	parts := make([]string, 0, len(toolResults))
+	for _, tr := range toolResults {
+		if len(tr.Content) == 0 {
+			continue
+		}
+		for _, c := range tr.Content {
+			if strings.TrimSpace(c.Text) != "" {
+				parts = append(parts, c.Text)
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		return minimalFallbackUserContent
+	}
+
+	joined := strings.Join(parts, "\n\n")
+	if len(joined) > 4000 {
+		return joined[:4000]
+	}
+	return joined
+}
+
+func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
+	for _, msg := range messages {
+		if msg.Role != "user" {
+			continue
+		}
+		text, _, toolResults := extractClaudeUserContent(msg.Content)
+		if strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+		if len(toolResults) > 0 {
+			return buildToolResultsContinuation(toolResults)
+		}
+	}
+
+	for _, msg := range messages {
+		if strings.TrimSpace(msg.Role) != "" {
+			if text := extractOpenAIMessageText(msg.Content); strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+	}
+
+	return ""
+}
+
+func firstOpenAIConversationAnchor(messages []OpenAIMessage) string {
+	for _, msg := range messages {
+		if msg.Role != "user" {
+			continue
+		}
+		text := extractOpenAIMessageText(msg.Content)
+		if strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+
+	for _, msg := range messages {
+		text := extractOpenAIMessageText(msg.Content)
+		if strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+
+	return ""
+}
+
+func buildConversationID(modelID, systemPrompt, anchor string) string {
+	anchor = strings.TrimSpace(anchor)
+	if anchor == "" {
+		return uuid.New().String()
+	}
+	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+func extractOpenAITextPart(part map[string]interface{}) (string, bool) {
+	partType, _ := part["type"].(string)
+	switch partType {
+	case "text", "input_text":
+		if t, ok := part["text"].(string); ok {
+			return t, true
+		}
+	}
+
+	if t, ok := part["text"].(string); ok {
+		return t, true
+	}
+
+	return "", false
+}
+
+func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
+	partType, _ := part["type"].(string)
+	if partType != "" {
+		switch partType {
+		case "image", "image_url", "input_image", "file", "input_file":
+		default:
+			return nil
+		}
+	}
+
+	if fileObj, ok := part["file"].(map[string]interface{}); ok {
+		if img := extractImageFromOpenAIPart(fileObj); img != nil {
+			return img
+		}
+	}
+
+	if sourceObj, ok := part["source"].(map[string]interface{}); ok {
+		if img := extractImageFromOpenAIPart(sourceObj); img != nil {
+			return img
+		}
+	}
+
+	if raw, ok := part["mime"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
+		return nil
+	}
+	if raw, ok := part["media_type"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
+		return nil
+	}
+	if raw, ok := part["mime_type"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
+		return nil
+	}
+
+	if raw, ok := part["url"].(string); ok {
+		if img := parseDataURL(raw); img != nil {
+			return img
+		}
+	}
+
+	if raw, ok := part["b64_json"].(string); ok {
+		if img := parseBase64Image(raw, "png"); img != nil {
+			return img
+		}
+	}
+
+	if raw, ok := part["image_url"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if img := parseDataURL(v); img != nil {
+				return img
+			}
+		case map[string]interface{}:
+			if u, ok := v["url"].(string); ok {
+				if img := parseDataURL(u); img != nil {
+					return img
+				}
+			}
+		}
+	}
+
+	if raw, ok := part["image_base64"].(string); ok {
+		if img := parseBase64Image(raw, "png"); img != nil {
+			return img
+		}
+	}
+	if raw, ok := part["data"].(string); ok {
+		if img := parseDataURL(raw); img != nil {
+			return img
+		}
+		if img := parseBase64Image(raw, "png"); img != nil {
+			return img
+		}
+	}
+
+	return nil
+}
+
+func sanitizeImagePlaceholders(text string) string {
+	re := regexp.MustCompile(`\[Image\s+\d+\]`)
+	cleaned := re.ReplaceAllString(text, "")
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	return strings.TrimSpace(cleaned)
+}
+
+func normalizeUserContent(text string, hasImages bool) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" && hasImages {
+		return "Please analyze the attached image."
+	}
+	return trimmed
+}
+
 func parseDataURL(url string) *KiroImage {
-	// data:image/png;base64,xxxxx
-	re := regexp.MustCompile(`^data:image/(\w+);base64,(.+)$`)
-	matches := re.FindStringSubmatch(url)
+	cleaned := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(url, "\n", ""), "\r", ""))
+	if strings.Contains(cleaned, "[Image") {
+		return nil
+	}
+	re := regexp.MustCompile(`^data:image/([a-zA-Z0-9+.-]+)(;[a-zA-Z0-9=._:+-]+)*;base64,(.+)$`)
+	matches := re.FindStringSubmatch(cleaned)
+	if len(matches) == 4 {
+		return parseBase64Image(matches[3], matches[1])
+	}
 	if len(matches) != 3 {
 		return nil
 	}
 
-	format := matches[1]
+	return parseBase64Image(matches[2], matches[1])
+}
+
+func parseBase64Image(data, format string) *KiroImage {
+	format = strings.ToLower(format)
 	if format == "jpg" {
 		format = "jpeg"
 	}
 
 	// 验证 base64
-	if _, err := base64.StdEncoding.DecodeString(matches[2]); err != nil {
-		return nil
+	if _, err := base64.StdEncoding.DecodeString(data); err != nil {
+		if _, errRaw := base64.RawStdEncoding.DecodeString(data); errRaw != nil {
+			if _, errURL := base64.URLEncoding.DecodeString(data); errURL != nil {
+				if _, errRawURL := base64.RawURLEncoding.DecodeString(data); errRawURL != nil {
+					return nil
+				}
+			}
+		}
+	}
+
+	if format == "" {
+		format = "png"
 	}
 
 	return &KiroImage{
 		Format: format,
 		Source: struct {
 			Bytes string `json:"bytes"`
-		}{Bytes: matches[2]},
+		}{Bytes: data},
 	}
 }
 

@@ -30,13 +30,6 @@ func GenerateMachineId() string {
 		bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
 }
 
-// normalizeAccountDefaults fills backward-compatible defaults.
-func normalizeAccountDefaults(a *Account) {
-	if a.Weight <= 0 {
-		a.Weight = 100
-	}
-}
-
 // Account represents a Kiro API account with authentication credentials and usage statistics.
 type Account struct {
 	// Basic identification
@@ -44,7 +37,6 @@ type Account struct {
 	Email    string `json:"email,omitempty"`    // User email address
 	UserId   string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
-	Weight   int    `json:"weight,omitempty"`   // Selection weight in weighted random (default: 100)
 
 	// Authentication credentials
 	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
@@ -57,6 +49,9 @@ type Account struct {
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+
+	// Priority weight for load balancing (higher = more requests)
+	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
@@ -94,12 +89,12 @@ type Account struct {
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`      // Admin panel password
-	Port          int       `json:"port"`          // HTTP server port (default: 8080)
-	Host          string    `json:"host"`          // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"`        // API key for client authentication
-	RequireApiKey bool      `json:"requireApiKey"` // Whether to enforce API key validation
-	Accounts      []Account `json:"accounts"`      // Registered Kiro accounts
+	Password      string    `json:"password"`         // Admin panel password
+	Port          int       `json:"port"`             // HTTP server port (default: 8080)
+	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
+	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
+	Accounts      []Account `json:"accounts"`         // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -110,13 +105,11 @@ type Config struct {
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
 	// Global statistics (persisted across restarts)
-	TotalRequests         int     `json:"totalRequests,omitempty"`         // Total API requests received
-	SuccessRequests       int     `json:"successRequests,omitempty"`       // Successful requests count
-	FailedRequests        int     `json:"failedRequests,omitempty"`        // Final failed requests count
-	AttemptFailedRequests int     `json:"attemptFailedRequests,omitempty"` // Failed attempts count (includes retry attempts)
-	TotalRetries          int     `json:"totalRetries,omitempty"`          // Total retries count (sum of attempts-1)
-	TotalTokens           int     `json:"totalTokens,omitempty"`           // Total tokens processed
-	TotalCredits          float64 `json:"totalCredits,omitempty"`          // Total credits consumed
+	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
+	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
+	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
+	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
+	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -140,7 +133,7 @@ type AccountInfo struct {
 }
 
 // Version 当前版本号
-const Version = "1.0.2"
+const Version = "1.0.3"
 
 var (
 	cfg     *Config
@@ -180,18 +173,7 @@ func Load() error {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return err
 	}
-	changed := false
-	for i := range c.Accounts {
-		old := c.Accounts[i].Weight
-		normalizeAccountDefaults(&c.Accounts[i])
-		if old != c.Accounts[i].Weight {
-			changed = true
-		}
-	}
 	cfg = &c
-	if changed {
-		return Save()
-	}
 	return nil
 }
 
@@ -248,9 +230,6 @@ func GetAccounts() []Account {
 	defer cfgLock.RUnlock()
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
-	for i := range accounts {
-		normalizeAccountDefaults(&accounts[i])
-	}
 	return accounts
 }
 
@@ -260,7 +239,6 @@ func GetEnabledAccounts() []Account {
 	var accounts []Account
 	for _, a := range cfg.Accounts {
 		if a.Enabled {
-			normalizeAccountDefaults(&a)
 			accounts = append(accounts, a)
 		}
 	}
@@ -270,7 +248,6 @@ func GetEnabledAccounts() []Account {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	normalizeAccountDefaults(&account)
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
 }
@@ -278,7 +255,6 @@ func AddAccount(account Account) error {
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	normalizeAccountDefaults(&account)
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i] = account
@@ -298,6 +274,48 @@ func DeleteAccount(id string) error {
 		}
 	}
 	return nil
+}
+
+// ImportAccounts imports multiple accounts from a JSON array.
+// This function is useful for batch importing accounts from external tools like KAM.
+// Duplicate accounts (same ID) are skipped with a warning.
+func ImportAccounts(accounts []Account) (int, int, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	imported := 0
+	skipped := 0
+	existingIDs := make(map[string]bool)
+
+	// Build map of existing account IDs
+	for _, a := range cfg.Accounts {
+		existingIDs[a.ID] = true
+	}
+
+	// Import new accounts
+	for _, account := range accounts {
+		if existingIDs[account.ID] {
+			skipped++
+			continue
+		}
+
+		// Generate machine ID if not present
+		if account.MachineId == "" {
+			account.MachineId = GenerateMachineId()
+		}
+
+		cfg.Accounts = append(cfg.Accounts, account)
+		existingIDs[account.ID] = true
+		imported++
+	}
+
+	if imported > 0 {
+		if err := Save(); err != nil {
+			return imported, skipped, err
+		}
+	}
+
+	return imported, skipped, nil
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
@@ -339,23 +357,21 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	return Save()
 }
 
-func UpdateStats(totalReq, successReq, failedReq, attemptFailedReq, totalRetries, totalTokens int, totalCredits float64) error {
+func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.TotalRequests = totalReq
 	cfg.SuccessRequests = successReq
 	cfg.FailedRequests = failedReq
-	cfg.AttemptFailedRequests = attemptFailedReq
-	cfg.TotalRetries = totalRetries
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
 	return Save()
 }
 
-func GetStats() (int, int, int, int, int, int, float64) {
+func GetStats() (int, int, int, int, float64) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.AttemptFailedRequests, cfg.TotalRetries, cfg.TotalTokens, cfg.TotalCredits
+	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {

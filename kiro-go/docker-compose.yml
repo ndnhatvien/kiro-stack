@@ -3,16 +3,10 @@ version: '3.8'
 services:
   kiro-go:
     build: .
-    container_name: kiro-go
     ports:
-      - "8088:8080"
+      - "8080:8080"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
-      - ADMIN_PASSWORD=change_this_password
-      - KIRO_GATEWAY_BASE=http://host.docker.internal:8001
-      - KIRO_GATEWAY_API_KEY=change_this_api_key
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
