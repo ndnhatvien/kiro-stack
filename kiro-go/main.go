@@ -54,11 +54,21 @@ func main() {
 	handler := proxy.NewHandler()
 
 	// 启动服务器
-	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
-	log.Printf("Kiro-Go starting on http://%s", addr)
-	log.Printf("Admin panel: http://%s/admin", addr)
-	log.Printf("Claude API: http://%s/v1/messages", addr)
-	log.Printf("OpenAI API: http://%s/v1/chat/completions", addr)
+	host := config.GetHost()
+	port := config.GetPort()
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	// 显示地址：0.0.0.0 转换为 localhost
+	displayHost := host
+	if host == "0.0.0.0" {
+		displayHost = "localhost"
+	}
+	displayAddr := fmt.Sprintf("%s:%d", displayHost, port)
+
+	log.Printf("Kiro-Go starting on http://%s", displayAddr)
+	log.Printf("Admin panel: http://%s/admin", displayAddr)
+	log.Printf("Claude API: http://%s/v1/messages", displayAddr)
+	log.Printf("OpenAI API: http://%s/v1/chat/completions", displayAddr)
 
 	// 创建自定义 HTTP 服务器，增加请求大小限制
 	server := &http.Server{
