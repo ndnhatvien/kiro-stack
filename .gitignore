@@ -37,8 +37,10 @@ kiro-go/kiro-go.exe
 .vscode/
 .idea/
 .shard/
+.claude/
 *.swp
 *.swo
+*~
 
 # ==============================
 # 调试日志（kiro-gateway）
